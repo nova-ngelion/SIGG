@@ -15,6 +15,8 @@ use crate::bytecode;
 use crate::pocket::cpu::{CpuState, cpu_run};
 use crate::state::SiggAgent;
 use crate::pocket::compute::ComputeSpace;
+use crate::pocket::asm;
+
 // use rayon::prelude::*;
 
 type Compiled = bytecode::CompiledProgram;
@@ -1691,6 +1693,16 @@ fn ai_create(stream: &mut TcpStream, pocket_state: &Arc<Mutex<PocketState>>) -> 
     // ★追加：I/O座標
     let io_in  = (read_i32(stream)?, read_i32(stream)?, read_i32(stream)?);
     let io_out = (read_i32(stream)?, read_i32(stream)?, read_i32(stream)?);
+    // --- 命令領域(0..=63)を避けるため、必要なら +256 ずらす
+    let guard = 256;
+    let prog_max = 64;
+
+    let mut io_in  = io_in;
+    let mut io_out = io_out;
+
+    if io_in.0 >= 0 && io_in.0 < prog_max { io_in.0 += guard; }
+    if io_out.0 >= 0 && io_out.0 < prog_max { io_out.0 += guard; }
+
     let pocket_in_addr  = (read_i32(stream)?, read_i32(stream)?, read_i32(stream)?);
     let pocket_out_addr = (read_i32(stream)?, read_i32(stream)?, read_i32(stream)?); // ★追加
     let pocket_score_addr = (read_i32(stream)?, read_i32(stream)?, read_i32(stream)?);
@@ -1707,14 +1719,34 @@ fn ai_create(stream: &mut TcpStream, pocket_state: &Arc<Mutex<PocketState>>) -> 
     if p.world != (u, v, w) {
         return write_err(stream, "world mismatch");
     }
-
-    // ComputeSpace 作成
+    // ---- space_id はここで確保（ブロック外）----
     let space_id = st.next_space_id;
     st.next_space_id += 1;
-    st.compute_spaces.insert(
-        space_id,
-        ComputeSpace::new_blank(space_size as i32, lanes),
-    );
+
+    // ComputeSpace 作成
+    let mut space = ComputeSpace::new_blank(space_size as i32, lanes);
+
+    // --- CPUプログラムをアセンブルしてロード
+    let src = r#"
+    start:
+    MOVI r1, 100
+    LOAD r2, r1, 0
+    MOVI r3, 102
+    LOAD r4, r3, 0
+    MOVI r5, 1
+    AND  r4, r4, r5
+    ADD  r4, r4, r5
+    ADD  r6, r2, r4
+    MOVI r7, 101
+    STORE r6, r7, 0
+    JMP start
+    "#;
+
+    let prog = asm::assemble(src).map_err(|e| SiggError::runtime(format!("assemble failed: {e}")))?;
+    load_program_into_space(&mut space, &prog);
+
+    // insert
+    st.compute_spaces.insert(space_id, space);
 
     // CPU 作成（handle 管理）
     let cpu_handle = st.next_handle;
@@ -1799,32 +1831,35 @@ fn ai_tick(stream: &mut TcpStream, pocket_state: &Arc<Mutex<PocketState>>) -> Re
     };
 
     // --- 2) Pocket -> in_bits
-    let in_bits: u32 = pocket.cell_read_f32(pin.0, pin.1, pin.2, 0).to_bits();
+    let in_bits: u32 = pocket.cpu_load_u32(pin.0, pin.1, pin.2, 0);//new
 
-    // --- 3) Pocket(policy) -> ComputeSpace(policy_cell)  (CPUが読み書きできるように)
-    let policy_cell = (io_out.0 + 1, io_out.1, io_out.2);
-    let mode_cell   = (io_out.0 + 2, io_out.1, io_out.2);
+    // CPUプログラムの前提アドレス（固定）//new{
+    let io_in_cell    = (100, 0, 0);
+    let io_out_cell   = (101, 0, 0);
+    let policy_cell   = (102, 0, 0);
+    let mode_cell     = (103, 0, 0); // 将来用
 
-    let policy_bits_in: u32 = pocket
-        .cell_read_f32(ppolicy.0, ppolicy.1, ppolicy.2, 0)
-        .to_bits();
+    space.write_cell_bits(io_in_cell.0, io_in_cell.1, io_in_cell.2, 0, in_bits);
+
+    let policy_bits_in: u32 = pocket.cell_read_f32(ppolicy.0, ppolicy.1, ppolicy.2, 0).to_bits();
     space.write_cell_bits(policy_cell.0, policy_cell.1, policy_cell.2, 0, policy_bits_in);
 
-    // --- 4) ComputeSpace(io_in) <- in_bits
-    space.write_cell_bits(io_in.0, io_in.1, io_in.2, 0, in_bits);
+    // CPU実行前に PC を毎回0に戻す（1tick=1思考サイクルにする）
+    cpu.pc = 0;
+    cpu.halted = false;
 
-    // --- 5) CPU実行
+    // 実行
     let ran = {
         let mut mem = space.as_pocket_adapter_mut();
         crate::pocket::cpu::cpu_run_mem(&mut mem, &mut cpu, budget)?
     };
 
-    // --- 6) out_bits を読む
-    let mut out_bits: u32 = space.read_cell_bits(io_out.0, io_out.1, io_out.2, 0);
+    // out読む
+    let mut out_bits: u32 = space.read_cell_bits(io_out_cell.0, io_out_cell.1, io_out_cell.2, 0);
 
-    // --- 7) policy を CPU から読み戻し → Pocketへ保存
+    // policy書き戻し（CPUが更新する将来に備える）
     let policy_bits_after: u32 = space.read_cell_bits(policy_cell.0, policy_cell.1, policy_cell.2, 0);
-    pocket.cell_write_f32(ppolicy.0, ppolicy.1, ppolicy.2, 0, f32::from_bits(policy_bits_after));
+    pocket.cell_write_f32(ppolicy.0, ppolicy.1, ppolicy.2, 0, f32::from_bits(policy_bits_after));//new
 
     // --- 8) 成否判定（+1）
     // policy_id: 0 => +1, 1 => +2（最小: 1bit）
@@ -1841,17 +1876,17 @@ fn ai_tick(stream: &mut TcpStream, pocket_state: &Arc<Mutex<PocketState>>) -> Re
     }
 
     // --- 10) Pocketへ out を書き戻し
-    pocket.cell_write_f32(pout.0, pout.1, pout.2, 0, f32::from_bits(out_bits));
+    pocket.cpu_store_u32(pout.0, pout.1, pout.2, 0, out_bits);//new
     // 自己フィードバック：Pocket(in) も out で上書き
-    pocket.cell_write_f32(pin.0, pin.1, pin.2, 0, f32::from_bits(out_bits));
+    pocket.cpu_store_u32(pin.0,  pin.1,  pin.2,  0, out_bits);//new
 
     // --- 11) score(EWMA) : policyに従って成功したら 1.0
-    let score_now: f32 = if ok_policy { 1.0 } else { 0.0 };
+    let score_now: f32 = if ok_policy { 1.0 } else { 0.0 };//new
     let mu_prev = f32::from_bits(mu_bits);
     let mu_new  = (1.0 - beta) * mu_prev + beta * score_now;
     let mu_new_bits = mu_new.to_bits();
 
-    pocket.cell_write_f32(pscore.0, pscore.1, pscore.2, 0, mu_new);
+    pocket.cpu_store_u32(pscore.0, pscore.1, pscore.2, 0, mu_new.to_bits());//new
 
     // mode を ComputeSpaceに出す（policyセルと衝突させない）
     let new_mode_bits: u32 = if mu_new < 0.5 { 1 } else { 0 };
@@ -1893,6 +1928,13 @@ fn ai_tick(stream: &mut TcpStream, pocket_state: &Arc<Mutex<PocketState>>) -> Re
     for v in observations { write_u32(stream, v)?; }
     Ok(())
 }
+
+fn load_program_into_space(space: &mut ComputeSpace, prog: &[u32]) {
+    // 命令は (x=0.., y=0, z=0, lane=0) に置く（cpu_step_memの設計通り）
+    for (i, &inst) in prog.iter().enumerate() {
+        space.write_cell_bits(i as i32, 0, 0, 0, inst);
+    }
+}//new
 
 
 
