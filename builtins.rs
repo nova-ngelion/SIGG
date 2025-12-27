@@ -312,6 +312,11 @@ fn value_to_hits(v: &Value) -> Result<Vec<Hit>, SiggError> {
         _ => Err(SiggError::runtime("expected hits tuple")),
     }
 }
+fn load_program_into_space(space: &mut ComputeSpace, prog: &[u32]) {
+    for (i, &inst) in prog.iter().enumerate() {
+        space.write_cell_bits(i as i32, 0, 0, 0, inst);
+    }
+}
 // ---------- basic builtins ----------
 fn builtin_print(args: Vec<Value>) -> Result<Value, SiggError> {
     for v in args {
@@ -530,7 +535,30 @@ fn builtin_ai_create(args: Vec<Value>) -> Result<Value, SiggError> {
     // ComputeSpace 作成
     let space_id = st.next_space_id;
     st.next_space_id += 1;
-    st.compute_spaces.insert(space_id, ComputeSpace::new_blank(space_size as i32, lanes));
+    let mut space = ComputeSpace::new_blank(space_size as i32, lanes);
+
+    // server.rs と同じ命令ロード（あなたが server で成功させたのと同一にする）
+    let src = r#"
+    start:
+    MOVI r1, 100
+    LOAD r2, r1, 0
+    MOVI r3, 102
+    LOAD r4, r3, 0
+    MOVI r5, 1
+    AND  r4, r4, r5
+    ADD  r4, r4, r5
+    ADD  r6, r2, r4
+    MOVI r7, 101
+    STORE r6, r7, 0
+    JMP start
+    "#;
+
+    let prog = crate::pocket::asm::assemble(src)
+        .map_err(|e| SiggError::runtime(format!("assemble failed: {e}")))?;
+    load_program_into_space(&mut space, &prog);
+
+    st.compute_spaces.insert(space_id, space);
+
 
     // CPU 作成
     let cpu_h = st.next_handle;
@@ -566,6 +594,7 @@ fn builtin_ai_create(args: Vec<Value>) -> Result<Value, SiggError> {
         Value::Number(cpu_h as f64),
     ]))
 }
+
 fn builtin_ai_tick(args: Vec<Value>) -> Result<Value, SiggError> {
     // ai_tick(agent_id, budget) -> (ran, pc, halted, in_bits, out_bits, score_mu, mode)
     need_n(&args, 2, "ai_tick")?;
@@ -600,6 +629,12 @@ fn builtin_ai_tick(args: Vec<Value>) -> Result<Value, SiggError> {
         (cpu, space, pocket)
     };
 
+    let io_in_cell  = (100, 0, 0);
+    let io_out_cell = (101, 0, 0);
+    let policy_cell = (102, 0, 0);
+    let mode_cell   = (103, 0, 0); // 将来用
+
+
     // 2) Pocket -> in_bits
     let in_bits: u32 = pocket.cell_read_f32(pin.0, pin.1, pin.2, 0).to_bits();
 
@@ -612,6 +647,10 @@ fn builtin_ai_tick(args: Vec<Value>) -> Result<Value, SiggError> {
 
     // 4) ComputeSpace(io_in) <- in_bits
     space.write_cell_bits(io_in.0, io_in.1, io_in.2, 0, in_bits);
+
+    cpu.pc = 0;
+    cpu.halted = false;
+
 
     // 5) CPU実行
     let ran = {
@@ -646,7 +685,7 @@ fn builtin_ai_tick(args: Vec<Value>) -> Result<Value, SiggError> {
     pocket.cell_write_f32(pin.0, pin.1, pin.2, 0, f32::from_bits(out_bits));
 
     // 11) score(EWMA)
-    let score_now: f32 = if ok_policy { 1.0 } else { 1.0 };
+    let score_now: f32 = if ok_policy { 1.0 } else { 0.0 };
     let mu_prev = f32::from_bits(mu_bits);
     let mu_new  = (1.0 - beta) * mu_prev + beta * score_now;
     let mu_new_bits = mu_new.to_bits();
