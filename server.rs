@@ -1709,8 +1709,6 @@ fn ai_create(stream: &mut TcpStream, pocket_state: &Arc<Mutex<PocketState>>) -> 
     // ★追加：policy座標
     let pocket_policy_addr = (read_i32(stream)?, read_i32(stream)?, read_i32(stream)?);
 
-
-
     let mut st = pocket_state.lock().unwrap();
 
     // pocket存在確認
