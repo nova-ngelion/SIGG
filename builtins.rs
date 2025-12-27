@@ -599,7 +599,7 @@ fn builtin_ai_tick(args: Vec<Value>) -> Result<Value, SiggError> {
     // ai_tick(agent_id, budget) -> (ran, pc, halted, in_bits, out_bits, score_mu, mode)
     need_n(&args, 2, "ai_tick")?;
     let agent_id = as_f64(&args[0])? as u64;
-    let budget = as_u32(&args[1])?;
+    let budget: u32 = 500;
 
     // 0) agentから必要値を抜く
     let (cpu_h, space_id, pocket_h, io_in, io_out, pin, pout, pscore, ppolicy, beta, mu_bits) = {
@@ -739,18 +739,19 @@ fn builtin_ai_get_mode(args: Vec<Value>) -> Result<Value, SiggError> {
     let ag = st.agents.get(&agent_id).ok_or_else(|| SiggError::runtime("bad agent"))?;
     Ok(Value::Number(ag.mode as f64))
 }
-
-//new　↑
-
-
-
-// ---------- small helpers ----------
 fn need_n(args: &Vec<Value>, n: usize, name: &str) -> Result<(), SiggError> {
     if args.len() != n {
         return Err(SiggError::runtime(format!("{name} expects {n} args")));
     }
     Ok(())
 }
+
+//new　↑
+
+
+
+// ---------- small helpers ----------
+
 
 fn as_f64(v: &Value) -> Result<f64, SiggError> {
     match v {
