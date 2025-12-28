@@ -12,5 +12,6 @@ pub mod vm;
 pub mod span;
 pub mod pocket;
 pub mod state;
+pub mod ai_runtime;
 
 pub mod server;

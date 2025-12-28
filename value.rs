@@ -68,6 +68,7 @@ pub enum Value {
     Str(String),
     Grid(GridRef),
     Tuple(Vec<Value>),
+    Handle(u32),
     Unit,
 }
 
@@ -87,6 +88,7 @@ impl std::fmt::Display for Value {
                 }
                 write!(f, ")")
             }
+            Value::Handle(h) => write!(f, "<handle:{h}>"),
             Value::Unit => write!(f, "()"),
         }
     }

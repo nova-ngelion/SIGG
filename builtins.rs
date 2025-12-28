@@ -4,7 +4,7 @@ use rayon::prelude::*;
 use std::sync::{Mutex, OnceLock};
 use crate::error::SiggError;
 use crate::value::{Boundary, Grid, GridRef, Value};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use crate::pocket;
 use crate::pocket::types::{WorldKey, ChunkKey, Hit};
 use crate::state::PocketState;
@@ -12,6 +12,13 @@ use crate::pocket::PocketWorld;
 use crate::pocket::compute::ComputeSpace;
 use crate::pocket::cpu::{CpuState, cpu_run_mem};
 use crate::state::SiggAgent;
+use crate::ai_runtime;
+
+const PROG_MAX: i32 = 64;   // 命令領域は 0..63
+const IO_BASE:  i32 = 100;  // io_in/io_out はここ以降へ
+const ENV_PERIOD: u32 = 30; // 30tickごとに正解が変わる（好みで調整）
+
+
 
 
 pub struct Builtin {
@@ -20,6 +27,7 @@ pub struct Builtin {
 }
 
 static LAST_DIGEST: AtomicU64 = AtomicU64::new(0);
+static AI_TICK: AtomicU32 = AtomicU32::new(0);//new
 
 pub fn last_digest_u32() -> u32 {
     LAST_DIGEST.load(Ordering::Relaxed) as u32
@@ -284,6 +292,29 @@ fn hits_to_value(hits: Vec<Hit>) -> Value {
     }
     Value::Tuple(out)
 }
+fn guard_io_xyz(mut p: (i32,i32,i32)) -> (i32,i32,i32) {
+    // 命令領域(0..PROG_MAX-1)への衝突を防ぐ
+    if p.0 >= 0 && p.0 < PROG_MAX {
+        p.0 = IO_BASE;
+    }
+    p
+}
+fn guard_io_pair(io_in: (i32,i32,i32), io_out: (i32,i32,i32)) -> ((i32,i32,i32),(i32,i32,i32)) {
+    let mut a = guard_io_xyz(io_in);
+    let mut b = guard_io_xyz(io_out);
+
+    // io_in と io_out が同じxにならないよう最低限ずらす
+    if a.0 == b.0 {
+        b.0 += 1;
+    }
+
+    // policy/modeセルが io_out+1 / io_out+2 を使う想定なら
+    // それらも命令領域に落ちないように（念のため）
+    if b.0 + 2 >= 0 && b.0 + 2 < PROG_MAX {
+        b.0 = IO_BASE + 1;
+    }
+    (a,b)
+}
 fn value_to_hits(v: &Value) -> Result<Vec<Hit>, SiggError> {
     match v {
         Value::Tuple(xs) => {
@@ -507,224 +538,179 @@ fn builtin_ai_pocket_read_f32(args: Vec<Value>) -> Result<Value, SiggError> {
     let p = st.pockets.get_mut(&h).ok_or_else(|| SiggError::runtime("bad pocket handle"))?;
     Ok(Value::F32(p.cell_read_f32(x,y,z,lane)))
 }
+// fn builtin_ai_create(args: Vec<Value>) -> Result<Value, SiggError> {
+//     // ai_create(pocket_h, u,v,w, space_size, lanes) -> (agent_id, space_id, cpu_h)
+//     need_n(&args, 6, "ai_create")?;
+//     let pocket_h = as_u32(&args[0])?;
+//     let world = as_worldkey3(&args, 1)?;
+//     let space_size = as_usize(&args[4])?;
+//     let lanes = as_usize(&args[5])?;
+
+//     let orig_in = (0,0,0);
+//     let orig_out = (1,0,0);
+//     let (io_in, io_out) = guard_io_pair(orig_in, orig_out);
+//     if io_in != orig_in || io_out != orig_out {
+//         eprintln!("[AI] io relocated: in={orig_in:?}->{io_in:?}, out={orig_out:?}->{io_out:?}");
+//     }
+//     let pocket_in_addr    = (0,0,0);
+//     let pocket_out_addr   = (1,0,0);
+//     let pocket_score_addr = (2,0,0);
+//     let pocket_policy_addr= (3,0,0);
+
+//     let mut st = ai_state().lock().map_err(|_| SiggError::runtime("ai_state poisoned"))?;
+
+//     // pocket存在確認 + world一致確認
+//     {
+//         let p = st.pockets.get(&pocket_h).ok_or_else(|| SiggError::runtime("bad pocket handle"))?;
+//         if p.world != world {
+//             return Err(SiggError::runtime("ai_create: world mismatch"));
+//         }
+//     }
+
+//     // ComputeSpace 作成
+//     let space_id = st.next_space_id;
+//     st.next_space_id += 1;
+//     let mut space = ComputeSpace::new_blank(space_size as i32, lanes);
+
+//     // server.rs と同じ命令ロード（あなたが server で成功させたのと同一にする）
+//     let src = r#"
+//     loop:
+//         // mode が 1 なら policy を反転（LSBだけ使う）
+//         LOAD  r5, r0, 103       // r5 = mode
+//         BRZ   r5, cont          // mode==0ならスキップ
+//         LOAD  r2, r0, 102       // r2 = policy_bits
+//         MOVI  r3, 1
+//         XOR   r2, r2, r3        // r2 ^= 1
+//         STORE r2, r0, 102       // policy更新
+
+//     cont:
+//         // out = in + (policy&1) + 1
+//         LOAD  r1, r0, 100       // in
+//         LOAD  r2, r0, 102       // policy
+//         MOVI  r3, 1
+//         AND   r2, r2, r3        // policy_id = policy&1
+//         MOVI  r4, 1
+//         ADD   r2, r2, r4        // policy_id+1
+//         ADD   r1, r1, r2        // in + (policy_id+1)
+//         STORE r1, r0, 101       // out
+//         JMP   loop
+//     "#;
+
+//     let prog = crate::pocket::asm::assemble(src)
+//         .map_err(|e| SiggError::runtime(format!("assemble failed: {e}")))?;
+//     load_program_into_space(&mut space, &prog);
+
+//     st.compute_spaces.insert(space_id, space);
+
+
+//     // CPU 作成
+//     let cpu_h = st.next_handle;
+//     st.next_handle += 1;
+//     st.cpu_states.insert(cpu_h, CpuState::new(world));
+
+//     // Agent 作成
+//     let agent_id = st.next_agent_id;
+//     st.next_agent_id += 1;
+
+//     st.agents.insert(agent_id, SiggAgent {
+//         id: agent_id,
+//         world,
+//         pocket_handle: pocket_h,
+//         space_id,
+//         cpu_handle: cpu_h,
+//         sensors_flags: 0,
+//         sensors_coords: vec![],
+//         io_in,
+//         io_out,
+//         pocket_in_addr,
+//         pocket_out_addr,
+//         pocket_score_addr,
+//         pocket_policy_addr,
+//         score_mu_bits: 0.0f32.to_bits(),
+//         score_beta: 0.20,
+//         mode: 0,
+//     });
+
+//     Ok(Value::Tuple(vec![
+//         Value::Number(agent_id as f64),
+//         Value::Number(space_id as f64),
+//         Value::Number(cpu_h as f64),
+//     ]))
+// }
 fn builtin_ai_create(args: Vec<Value>) -> Result<Value, SiggError> {
-    // ai_create(pocket_h, u,v,w, space_size, lanes) -> (agent_id, space_id, cpu_h)
-    need_n(&args, 6, "ai_create")?;
-    let pocket_h = as_u32(&args[0])?;
-    let world = as_worldkey3(&args, 1)?;
-    let space_size = as_usize(&args[4])?;
-    let lanes = as_usize(&args[5])?;
+    // 以前のSIGGプログラム互換：ai_create(pocket) の1引数
+    need_n(&args, 1, "ai_create")?;
+    let pocket_h = as_f64(&args[0])? as u32;
 
-    let io_in  = (0,0,0);
-    let io_out = (1,0,0);
-    let pocket_in_addr    = (0,0,0);
-    let pocket_out_addr   = (1,0,0);
-    let pocket_score_addr = (2,0,0);
-    let pocket_policy_addr= (3,0,0);
+    // 命令領域(0..63)と衝突しないI/O（以前成功した100番台）
+    let io_in:  (i32,i32,i32) = (100, 0, 0);
+    let io_out: (i32,i32,i32) = (101, 0, 0);
+    let score_beta: f32 = 0.20;
 
-    let mut st = ai_state().lock().map_err(|_| SiggError::runtime("ai_state poisoned"))?;
+    // デフォルト（必要ならSIGG側で別builtin作って可変にしてOK）
+    let space_size: i32 = 1024;
+    let lanes: usize = 1;
 
-    // pocket存在確認 + world一致確認
-    {
-        let p = st.pockets.get(&pocket_h).ok_or_else(|| SiggError::runtime("bad pocket handle"))?;
-        if p.world != world {
-            return Err(SiggError::runtime("ai_create: world mismatch"));
-        }
-    }
+    let mut st = ai_state()
+        .lock()
+        .map_err(|_| SiggError::runtime("ai_state poisoned"))?;
 
-    // ComputeSpace 作成
-    let space_id = st.next_space_id;
-    st.next_space_id += 1;
-    let mut space = ComputeSpace::new_blank(space_size as i32, lanes);
+    // pocket から world を取得して整合させる
+    let p = st.pockets
+        .get(&pocket_h)
+        .ok_or_else(|| SiggError::runtime("bad pocket handle"))?;
+    let world = p.world; // (u,v,w)
 
-    // server.rs と同じ命令ロード（あなたが server で成功させたのと同一にする）
-    let src = r#"
-    start:
-    MOVI r1, 100
-    LOAD r2, r1, 0
-    MOVI r3, 102
-    LOAD r4, r3, 0
-    MOVI r5, 1
-    AND  r4, r4, r5
-    ADD  r4, r4, r5
-    ADD  r6, r2, r4
-    MOVI r7, 101
-    STORE r6, r7, 0
-    JMP start
-    "#;
-
-    let prog = crate::pocket::asm::assemble(src)
-        .map_err(|e| SiggError::runtime(format!("assemble failed: {e}")))?;
-    load_program_into_space(&mut space, &prog);
-
-    st.compute_spaces.insert(space_id, space);
-
-
-    // CPU 作成
-    let cpu_h = st.next_handle;
-    st.next_handle += 1;
-    st.cpu_states.insert(cpu_h, CpuState::new(world));
-
-    // Agent 作成
-    let agent_id = st.next_agent_id;
-    st.next_agent_id += 1;
-
-    st.agents.insert(agent_id, SiggAgent {
-        id: agent_id,
+    let agent_id: u64 = crate::ai_runtime::ai_create_core(
+        &mut st,
         world,
-        pocket_handle: pocket_h,
-        space_id,
-        cpu_handle: cpu_h,
-        sensors_flags: 0,
-        sensors_coords: vec![],
+        pocket_h,
         io_in,
         io_out,
-        pocket_in_addr,
-        pocket_out_addr,
-        pocket_score_addr,
-        pocket_policy_addr,
-        score_mu_bits: 0.0f32.to_bits(),
-        score_beta: 0.20,
-        mode: 0,
-    });
+        score_beta,
+        space_size,
+        lanes,
+    )?;
 
-    Ok(Value::Tuple(vec![
-        Value::Number(agent_id as f64),
-        Value::Number(space_id as f64),
-        Value::Number(cpu_h as f64),
-    ]))
+    Ok(Value::Number(agent_id as f64))
 }
 
 fn builtin_ai_tick(args: Vec<Value>) -> Result<Value, SiggError> {
-    // ai_tick(agent_id, budget) -> (ran, pc, halted, in_bits, out_bits, score_mu, mode)
     need_n(&args, 2, "ai_tick")?;
     let agent_id = as_f64(&args[0])? as u64;
-    let budget: u32 = 500;
+    let budget   = as_f64(&args[1])? as u32;
 
-    // 0) agentから必要値を抜く
-    let (cpu_h, space_id, pocket_h, io_in, io_out, pin, pout, pscore, ppolicy, beta, mu_bits) = {
-        let st = ai_state().lock().map_err(|_| SiggError::runtime("ai_state poisoned"))?;
-        let ag = st.agents.get(&agent_id).ok_or_else(|| SiggError::runtime("bad agent"))?;
-        (
-            ag.cpu_handle,
-            ag.space_id,
-            ag.pocket_handle,
-            ag.io_in,
-            ag.io_out,
-            ag.pocket_in_addr,
-            ag.pocket_out_addr,
-            ag.pocket_score_addr,
-            ag.pocket_policy_addr,
-            ag.score_beta,
-            ag.score_mu_bits,
-        )
-    };
+    let mut st = ai_state()
+        .lock()
+        .map_err(|_| SiggError::runtime("ai_state poisoned"))?;
 
-    // 1) cpu/space/pocket を remove して同時に触る
-    let (mut cpu, mut space, mut pocket) = {
-        let mut st = ai_state().lock().map_err(|_| SiggError::runtime("ai_state poisoned"))?;
-        let cpu = st.cpu_states.remove(&cpu_h).ok_or_else(|| SiggError::runtime("bad cpu"))?;
-        let space = st.compute_spaces.remove(&space_id).ok_or_else(|| SiggError::runtime("bad space"))?;
-        let pocket = st.pockets.remove(&pocket_h).ok_or_else(|| SiggError::runtime("bad pocket"))?;
-        (cpu, space, pocket)
-    };
+    let r = crate::ai_runtime::ai_tick_core(&mut st, agent_id, budget)?;
 
-    let io_in_cell  = (100, 0, 0);
-    let io_out_cell = (101, 0, 0);
-    let policy_cell = (102, 0, 0);
-    let mode_cell   = (103, 0, 0); // 将来用
+    // ログ（SIGG側printと二重になるなら消してOK）
+    println!("mu=\n{}\nmode=\n{}", r.mu, r.mode);
+    println!(
+        "tick=\n{}\nenv=\n{}\nin=\n{}\nout=\n{}\nexp=\n{}\nok=\n{}",
+        r.tick,
+        r.env_bit,
+        r.in_bits,
+        r.out_bits,
+        r.expect,
+        if r.ok { 1 } else { 0 }
+    );
 
-
-    // 2) Pocket -> in_bits
-    let in_bits: u32 = pocket.cell_read_f32(pin.0, pin.1, pin.2, 0).to_bits();
-
-    // 3) Pocket(policy) -> ComputeSpace(policy_cell)
-    let policy_cell = (io_out.0 + 1, io_out.1, io_out.2);
-    let mode_cell   = (io_out.0 + 2, io_out.1, io_out.2);
-
-    let policy_bits_in: u32 = pocket.cell_read_f32(ppolicy.0, ppolicy.1, ppolicy.2, 0).to_bits();
-    space.write_cell_bits(policy_cell.0, policy_cell.1, policy_cell.2, 0, policy_bits_in);
-
-    // 4) ComputeSpace(io_in) <- in_bits
-    space.write_cell_bits(io_in.0, io_in.1, io_in.2, 0, in_bits);
-
-    cpu.pc = 0;
-    cpu.halted = false;
-
-
-    // 5) CPU実行
-    let ran = {
-        let mut mem = space.as_pocket_adapter_mut();
-        cpu_run_mem(&mut mem, &mut cpu, budget)?
-    };
-
-    // 6) out_bits を読む
-    let mut out_bits: u32 = space.read_cell_bits(io_out.0, io_out.1, io_out.2, 0);
-
-    // 7) policy を CPU から読み戻し → Pocketへ保存
-    let policy_bits_after: u32 = space.read_cell_bits(policy_cell.0, policy_cell.1, policy_cell.2, 0);
-    pocket.cell_write_f32(ppolicy.0, ppolicy.1, ppolicy.2, 0, f32::from_bits(policy_bits_after));
-
-    // 8) 成否判定（最小：in + (policy_id+1)）
-    let policy_id: u32 = policy_bits_after & 1;
-    let expect: u32 = in_bits.wrapping_add(policy_id + 1);
-    let ok_policy: bool = out_bits == expect;
-
-    //修正後{
-    // fallbackで正解に合わせたら「最低限の成功」として1点にする
-    let mut ok_effective = ok_policy;
-    if !ok_policy {
-        out_bits = expect;
-        space.write_cell_bits(io_out.0, io_out.1, io_out.2, 0, out_bits);
-        ok_effective = true;  // ←ここがポイント
-    }
-    //}
-
-    // 10) Pocketへ out、さらに self-feedback（inも上書き）
-    pocket.cell_write_f32(pout.0, pout.1, pout.2, 0, f32::from_bits(out_bits));
-    pocket.cell_write_f32(pin.0, pin.1, pin.2, 0, f32::from_bits(out_bits));
-
-    // 11) score(EWMA)
-    let score_now: f32 = if ok_policy { 1.0 } else { 0.0 };
-    let mu_prev = f32::from_bits(mu_bits);
-    let mu_new  = (1.0 - beta) * mu_prev + beta * score_now;
-    let mu_new_bits = mu_new.to_bits();
-
-    pocket.cell_write_f32(pscore.0, pscore.1, pscore.2, 0, mu_new);
-
-    // mode
-    let new_mode_bits: u32 = if mu_new < 0.5 { 1 } else { 0 };
-    space.write_cell_bits(mode_cell.0, mode_cell.1, mode_cell.2, 0, new_mode_bits);
-
-    // Agentへ保存
-    {
-        let mut st = ai_state().lock().map_err(|_| SiggError::runtime("ai_state poisoned"))?;
-        let ag = st.agents.get_mut(&agent_id).ok_or_else(|| SiggError::runtime("bad agent"))?;
-        ag.score_mu_bits = mu_new_bits;
-        ag.mode = new_mode_bits;
-    }
-
-    let pc_out = cpu.pc;
-    let halted_out: u32 = if cpu.halted { 1 } else { 0 };
-
-    // 12) 戻す
-    {
-        let mut st = ai_state().lock().map_err(|_| SiggError::runtime("ai_state poisoned"))?;
-        st.cpu_states.insert(cpu_h, cpu);
-        st.compute_spaces.insert(space_id, space);
-        st.pockets.insert(pocket_h, pocket);
-    }
-
+    // SIGGプログラムの destructuring と一致させる（8要素）
     Ok(Value::Tuple(vec![
-        Value::Number(ran as f64),
-        Value::Number(pc_out as f64),
-        Value::Number(halted_out as f64),
-        Value::Number(in_bits as f64),
-        Value::Number(out_bits as f64),
-        Value::F32(mu_new),
-        Value::Number(new_mode_bits as f64),
+        Value::Number(r.tick as f64),
+        Value::Number(r.env_bit as f64),
+        Value::Number(r.in_bits as f64),
+        Value::Number(r.out_bits as f64),
+        Value::Number(r.expect as f64),
+        Value::Number(if r.ok { 1.0 } else { 0.0 }),
+        Value::Number(r.mu as f64),
+        Value::Number(r.mode as f64),
     ]))
 }
+
 fn builtin_ai_get_score(args: Vec<Value>) -> Result<Value, SiggError> {
     need_n(&args, 1, "ai_get_score")?;
     let agent_id = as_f64(&args[0])? as u64;

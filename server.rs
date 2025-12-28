@@ -4,9 +4,10 @@ use std::net::{TcpListener, TcpStream};
 use crate::state::PocketState;
 use crate::pocket::types::{WorldKey, hash64};
 use std::sync::{
-    atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering},
+    atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering as AtomicOrdering},
     Arc, Condvar, Mutex,
 };
+use std::sync::atomic::Ordering;
 
 use std::thread;
 use crate::error::SiggError;
@@ -16,6 +17,8 @@ use crate::pocket::cpu::{CpuState, cpu_run};
 use crate::state::SiggAgent;
 use crate::pocket::compute::ComputeSpace;
 use crate::pocket::asm;
+use crate::ai_runtime;
+
 
 // use rayon::prelude::*;
 
@@ -25,9 +28,15 @@ lazy_static::lazy_static! {
     static ref CACHE: Mutex<HashMap<u64, Arc<Compiled>>> = Mutex::new(HashMap::new());
 }
 
+static AI_TICK: AtomicU32 = AtomicU32::new(0);//new
+
 // ============================
 // V4 protocol (fixed-binary API)
 // ============================
+const PROG_MAX: i32 = 64;//new
+const IO_BASE: i32 = 100;//new
+const ENV_PERIOD: u32 = 30; // 30tickごとに正解が変わる（好みで調整）//new
+
 
 const TAG_RUN_ONCE: u32 = 1;
 const TAG_SUBMIT_BATCH: u32 = 0x20;
@@ -1682,104 +1691,146 @@ pub fn main_server_bin() -> Result<(), SiggError> {
 //   u64 agent_id
 //   u32 space_id
 //
-fn ai_create(stream: &mut TcpStream, pocket_state: &Arc<Mutex<PocketState>>) -> Result<(), SiggError> {
-    let pocket_h = read_u32(stream)?;
-    let u = read_u32(stream)?;
-    let v = read_u32(stream)?;
-    let w = read_u32(stream)?;
-    let space_size = read_u32(stream)? as usize;
-    let lanes = read_u32(stream)? as usize;
 
-    // ★追加：I/O座標
-    let io_in  = (read_i32(stream)?, read_i32(stream)?, read_i32(stream)?);
-    let io_out = (read_i32(stream)?, read_i32(stream)?, read_i32(stream)?);
-    // --- 命令領域(0..=63)を避けるため、必要なら +256 ずらす
-    let guard = 256;
-    let prog_max = 64;
-
-    let mut io_in  = io_in;
-    let mut io_out = io_out;
-
-    if io_in.0 >= 0 && io_in.0 < prog_max { io_in.0 += guard; }
-    if io_out.0 >= 0 && io_out.0 < prog_max { io_out.0 += guard; }
-
-    let pocket_in_addr  = (read_i32(stream)?, read_i32(stream)?, read_i32(stream)?);
-    let pocket_out_addr = (read_i32(stream)?, read_i32(stream)?, read_i32(stream)?); // ★追加
-    let pocket_score_addr = (read_i32(stream)?, read_i32(stream)?, read_i32(stream)?);
-    // ★追加：policy座標
-    let pocket_policy_addr = (read_i32(stream)?, read_i32(stream)?, read_i32(stream)?);
-
-    let mut st = pocket_state.lock().unwrap();
-
-    // pocket存在確認
-    let p = st.pockets.get(&pocket_h)
-        .ok_or_else(|| SiggError::runtime("bad pocket handle"))?;
-    if p.world != (u, v, w) {
-        return write_err(stream, "world mismatch");
+fn guard_io_xyz(mut p: (i32,i32,i32)) -> (i32,i32,i32) {
+    if p.0 >= 0 && p.0 < PROG_MAX {
+        p.0 = IO_BASE;
     }
-    // ---- space_id はここで確保（ブロック外）----
-    let space_id = st.next_space_id;
-    st.next_space_id += 1;
+    p
+}
 
-    // ComputeSpace 作成
-    let mut space = ComputeSpace::new_blank(space_size as i32, lanes);
+fn guard_io_pair(io_in: (i32,i32,i32), io_out: (i32,i32,i32)) -> ((i32,i32,i32),(i32,i32,i32)) {
+    let mut a = guard_io_xyz(io_in);
+    let mut b = guard_io_xyz(io_out);
+    if a.0 == b.0 { b.0 += 1; }
+    if b.0 + 2 >= 0 && b.0 + 2 < PROG_MAX { b.0 = IO_BASE + 1; }
+    (a,b)
+}
+// fn ai_create(stream: &mut TcpStream, pocket_state: &Arc<Mutex<PocketState>>) -> Result<(), SiggError> {
+//     let pocket_h = read_u32(stream)?;
+//     let u = read_u32(stream)?;
+//     let v = read_u32(stream)?;
+//     let w = read_u32(stream)?;
+//     let space_size = read_u32(stream)? as usize;
+//     let lanes = read_u32(stream)? as usize;
 
-    // --- CPUプログラムをアセンブルしてロード
-    let src = r#"
-    start:
-    MOVI r1, 100
-    LOAD r2, r1, 0
-    MOVI r3, 102
-    LOAD r4, r3, 0
-    MOVI r5, 1
-    AND  r4, r4, r5
-    ADD  r4, r4, r5
-    ADD  r6, r2, r4
-    MOVI r7, 101
-    STORE r6, r7, 0
-    JMP start
-    "#;
+//     // ★追加：I/O座標
+//     // ★命令領域衝突ガード（最重要）
+//     let orig_in  = (read_i32(stream)?, read_i32(stream)?, read_i32(stream)?);
+//     let orig_out = (read_i32(stream)?, read_i32(stream)?, read_i32(stream)?);
+//     let (io_in, io_out) = guard_io_pair(orig_in, orig_out);
+//     if io_in != orig_in || io_out != orig_out {
+//         eprintln!("[AI] io relocated: in={orig_in:?}->{io_in:?}, out={orig_out:?}->{io_out:?}");
+//     }
+//     // --- 命令領域(0..=63)を避けるため、必要なら +256 ずらす
+//     let guard = 256;
+//     let prog_max = 64;
 
-    let prog = asm::assemble(src).map_err(|e| SiggError::runtime(format!("assemble failed: {e}")))?;
-    load_program_into_space(&mut space, &prog);
+//     let mut io_in  = io_in;
+//     let mut io_out = io_out;
 
-    // insert
-    st.compute_spaces.insert(space_id, space);
+//     if io_in.0 >= 0 && io_in.0 < prog_max { io_in.0 += guard; }
+//     if io_out.0 >= 0 && io_out.0 < prog_max { io_out.0 += guard; }
 
-    // CPU 作成（handle 管理）
-    let cpu_handle = st.next_handle;
-    st.next_handle += 1;
-    st.cpu_states.insert(cpu_handle, CpuState::new((u, v, w)));
+//     let pocket_in_addr  = (read_i32(stream)?, read_i32(stream)?, read_i32(stream)?);
+//     let pocket_out_addr = (read_i32(stream)?, read_i32(stream)?, read_i32(stream)?); // ★追加
+//     let pocket_score_addr = (read_i32(stream)?, read_i32(stream)?, read_i32(stream)?);
+//     // ★追加：policy座標
+//     let pocket_policy_addr = (read_i32(stream)?, read_i32(stream)?, read_i32(stream)?);
 
-    // Agent 作成（参照のみ）
-    let agent_id = st.next_agent_id;
-    st.next_agent_id += 1;
+//     let mut st = pocket_state.lock().unwrap();
 
-    st.agents.insert(agent_id, SiggAgent {
-        id: agent_id,
-        world: (u, v, w),
-        pocket_handle: pocket_h,
-        space_id,
-        cpu_handle,
-        sensors_flags: 0,
-        sensors_coords: vec![],
-        io_in,
-        io_out,
-        pocket_in_addr,
-        pocket_out_addr,
-        pocket_score_addr,
-        pocket_policy_addr,
-        score_mu_bits: 0.0f32.to_bits(),
-        score_beta: 0.20,
-        mode: 0,
+//     // pocket存在確認
+//     let p = st.pockets.get(&pocket_h)
+//         .ok_or_else(|| SiggError::runtime("bad pocket handle"))?;
+//     if p.world != (u, v, w) {
+//         return write_err(stream, "world mismatch");
+//     }
+//     // ---- space_id はここで確保（ブロック外）----
+//     let space_id = st.next_space_id;
+//     st.next_space_id += 1;
+
+//     // ComputeSpace 作成
+//     let mut space = ComputeSpace::new_blank(space_size as i32, lanes);
+
+//     // --- CPUプログラムをアセンブルしてロード
+//     let src = r#"
+//     loop:
+//         LOAD  r1, r0, 100      // r1 = in_bits
+//         LOAD  r2, r0, 102      // r2 = policy_bits
+//         MOVI  r3, 1
+//         AND   r2, r2, r3       // r2 = policy_id (0 or 1)
+//         MOVI  r4, 1
+//         ADD   r2, r2, r4       // r2 = policy_id + 1
+//         ADD   r1, r1, r2       // r1 = in_bits + (policy_id+1)
+//         STORE r1, r0, 101      // out_bits
+//         JMP   loop
+//     "#;
+
+//     let prog = asm::assemble(src).map_err(|e| SiggError::runtime(format!("assemble failed: {e}")))?;
+//     load_program_into_space(&mut space, &prog);
+
+//     // insert
+//     st.compute_spaces.insert(space_id, space);
+
+//     // CPU 作成（handle 管理）
+//     let cpu_handle = st.next_handle;
+//     st.next_handle += 1;
+//     st.cpu_states.insert(cpu_handle, CpuState::new((u, v, w)));
+
+//     // Agent 作成（参照のみ）
+//     let agent_id = st.next_agent_id;
+//     st.next_agent_id += 1;
+
+//     st.agents.insert(agent_id, SiggAgent {
+//         id: agent_id,
+//         world: (u, v, w),
+//         pocket_handle: pocket_h,
+//         space_id,
+//         cpu_handle,
+//         sensors_flags: 0,
+//         sensors_coords: vec![],
+//         io_in,
+//         io_out,
+//         pocket_in_addr,
+//         pocket_out_addr,
+//         pocket_score_addr,
+//         pocket_policy_addr,
+//         score_mu_bits: 0.0f32.to_bits(),
+//         score_beta: 0.20,
+//         mode: 0,
         
-    });
+//     });
     
 
-    write_ok(stream)?;
-    write_u64(stream, agent_id)?;
-    write_u32(stream, space_id)?;
-    write_u32(stream, cpu_handle)?;
+//     write_ok(stream)?;
+//     write_u64(stream, agent_id)?;
+//     write_u32(stream, space_id)?;
+//     write_u32(stream, cpu_handle)?;
+//     Ok(())
+// }
+
+fn ai_create(stream: &mut TcpStream, pocket_state: &Arc<Mutex<PocketState>>) -> Result<(), SiggError> {
+    // 例：クライアントから pocket_handle を受け取る
+    let pocket_handle = read_u32(stream)?;
+
+    let mut st = pocket_state
+        .lock()
+        .map_err(|_| SiggError::runtime("pocket_state poisoned"))?;
+
+    let id = crate::ai_runtime::ai_create_core(
+        &mut st,
+        (0, 0, 0),
+        pocket_handle,
+        (100, 0, 0),
+        (101, 0, 0),
+        0.2,
+        1024,
+        1,
+    )?;
+
+    // 返信：agent_id(u64)
+    write_u64(stream, id)?;
     Ok(())
 }
 
@@ -1797,135 +1848,24 @@ fn ai_create(stream: &mut TcpStream, pocket_state: &Arc<Mutex<PocketState>>) -> 
 // --- agentから必要値を抜く（値コピーだけ。中間ロックを増やさない）
 fn ai_tick(stream: &mut TcpStream, pocket_state: &Arc<Mutex<PocketState>>) -> Result<(), SiggError> {
     let agent_id = read_u64(stream)?;
-    let budget   = read_u32(stream)?;
+    let budget   = read_u32(stream)?; // ← セミコロン必須
 
-    // --- 0) agent から必要値を値として抜く（ロック短く）
-    let (cpu_h, space_id, pocket_h, io_in, io_out, pin, pout, pscore, ppolicy, beta, mu_bits, sensors3) = {
-        let st = pocket_state.lock().unwrap();
-        let ag = st.agents.get(&agent_id).ok_or_else(|| SiggError::runtime("bad agent"))?;
-        (
-            ag.cpu_handle,
-            ag.space_id,
-            ag.pocket_handle,
-            ag.io_in,
-            ag.io_out,
-            ag.pocket_in_addr,
-            ag.pocket_out_addr,
-            ag.pocket_score_addr,
-            ag.pocket_policy_addr,
-            ag.score_beta,
-            ag.score_mu_bits,
-            ag.sensors_coords.clone(),
-        )
-    };
+    let mut st = pocket_state
+        .lock()
+        .map_err(|_| SiggError::runtime("pocket_state poisoned"))?;
 
-    // --- 1) cpu/space/pocket を remove して同時に触る（借用衝突回避）
-    let (mut cpu, mut space, mut pocket) = {
-        let mut st = pocket_state.lock().unwrap();
-        let cpu    = st.cpu_states.remove(&cpu_h).ok_or_else(|| SiggError::runtime("bad cpu"))?;
-        let space  = st.compute_spaces.remove(&space_id).ok_or_else(|| SiggError::runtime("bad space"))?;
-        let pocket = st.pockets.remove(&pocket_h).ok_or_else(|| SiggError::runtime("bad pocket handle"))?;
-        (cpu, space, pocket)
-    };
+    let r = crate::ai_runtime::ai_tick_core(&mut st, agent_id, budget)?;
 
-    // --- 2) Pocket -> in_bits
-    let in_bits: u32 = pocket.cpu_load_u32(pin.0, pin.1, pin.2, 0);//new
+    println!("mu=\n{}\nmode=\n{}", r.mu, r.mode);
 
-    // CPUプログラムの前提アドレス（固定）//new{
-    let io_in_cell    = (100, 0, 0);
-    let io_out_cell   = (101, 0, 0);
-    let policy_cell   = (102, 0, 0);
-    let mode_cell     = (103, 0, 0); // 将来用
-
-    space.write_cell_bits(io_in_cell.0, io_in_cell.1, io_in_cell.2, 0, in_bits);
-
-    let policy_bits_in: u32 = pocket.cell_read_f32(ppolicy.0, ppolicy.1, ppolicy.2, 0).to_bits();
-    space.write_cell_bits(policy_cell.0, policy_cell.1, policy_cell.2, 0, policy_bits_in);
-
-    // CPU実行前に PC を毎回0に戻す（1tick=1思考サイクルにする）
-    cpu.pc = 0;
-    cpu.halted = false;
-
-    // 実行
-    let ran = {
-        let mut mem = space.as_pocket_adapter_mut();
-        crate::pocket::cpu::cpu_run_mem(&mut mem, &mut cpu, budget)?
-    };
-
-    // out読む
-    let mut out_bits: u32 = space.read_cell_bits(io_out_cell.0, io_out_cell.1, io_out_cell.2, 0);
-
-    // policy書き戻し（CPUが更新する将来に備える）
-    let policy_bits_after: u32 = space.read_cell_bits(policy_cell.0, policy_cell.1, policy_cell.2, 0);
-    pocket.cell_write_f32(ppolicy.0, ppolicy.1, ppolicy.2, 0, f32::from_bits(policy_bits_after));//new
-
-    // --- 8) 成否判定（+1）
-    // policy_id: 0 => +1, 1 => +2（最小: 1bit）
-    let policy_id: u32 = policy_bits_after & 1;
-    let expect: u32 = in_bits.wrapping_add(policy_id + 1);
-    let ok_policy: bool = out_bits == expect;
-
-    // --- 9) 失敗なら fallback = policy（かつ ComputeSpace上の出力も揃える）
-    if !ok_policy {
-        // fallback は「policyに従った期待値」を採用
-        out_bits = expect;
-
-        space.write_cell_bits(io_out.0, io_out.1, io_out.2, 0, out_bits);
-    }
-
-    // --- 10) Pocketへ out を書き戻し
-    pocket.cpu_store_u32(pout.0, pout.1, pout.2, 0, out_bits);//new
-    // 自己フィードバック：Pocket(in) も out で上書き
-    pocket.cpu_store_u32(pin.0,  pin.1,  pin.2,  0, out_bits);//new
-
-    // --- 11) score(EWMA) : policyに従って成功したら 1.0
-    let score_now: f32 = if ok_policy { 1.0 } else { 0.0 };//new
-    let mu_prev = f32::from_bits(mu_bits);
-    let mu_new  = (1.0 - beta) * mu_prev + beta * score_now;
-    let mu_new_bits = mu_new.to_bits();
-
-    pocket.cpu_store_u32(pscore.0, pscore.1, pscore.2, 0, mu_new.to_bits());//new
-
-    // mode を ComputeSpaceに出す（policyセルと衝突させない）
-    let new_mode_bits: u32 = if mu_new < 0.5 { 1 } else { 0 };
-    space.write_cell_bits(mode_cell.0, mode_cell.1, mode_cell.2, 0, new_mode_bits);
-
-    // Agent側にも保存（次tickに持ち越す）
-    {
-        let mut st = pocket_state.lock().unwrap();
-        let ag = st.agents.get_mut(&agent_id).ok_or_else(|| SiggError::runtime("bad agent"))?;
-        ag.score_mu_bits = mu_new_bits;
-        ag.mode = new_mode_bits;
-    }
-
-    // --- 12) センサー観測
-    let mut observations = Vec::with_capacity(sensors3.len());
-    for (x, y, z) in sensors3 {
-        observations.push(space.read_cell_bits(x, y, z, 0));
-    }
-
-    let pc_out = cpu.pc;
-    let halted_out: u32 = if cpu.halted { 1 } else { 0 };
-
-    // --- 13) 戻す
-    {
-        let mut st = pocket_state.lock().unwrap();
-        st.cpu_states.insert(cpu_h, cpu);
-        st.compute_spaces.insert(space_id, space);
-        st.pockets.insert(pocket_h, pocket);
-    }
-
-    // --- 14) 応答
-    write_ok(stream)?;
-    write_u32(stream, ran)?;
-    write_u32(stream, pc_out)?;
-    write_u32(stream, halted_out)?;
-    write_u32(stream, in_bits)?;
-    write_u32(stream, out_bits)?;
-    write_u32(stream, observations.len() as u32)?;
-    for v in observations { write_u32(stream, v)?; }
+    // 返信（必要なものだけ送る：例として tick, ok, mu, mode）
+    write_u32(stream, r.tick)?;
+    write_u32(stream, if r.ok { 1 } else { 0 })?;
+    write_u32(stream, r.mu.to_bits())?;
+    write_u32(stream, r.mode)?;
     Ok(())
 }
+
 
 fn load_program_into_space(space: &mut ComputeSpace, prog: &[u32]) {
     // 命令は (x=0.., y=0, z=0, lane=0) に置く（cpu_step_memの設計通り）
