@@ -10,7 +10,8 @@ use crate::state::{PocketState, SiggAgent};
 // 共有の環境(②用)
 // =====================
 static AI_TICK: AtomicU32 = AtomicU32::new(0);
-pub const ENV_PERIOD: u32 = 30; // 10〜50で好み調整
+// Environment period (ticks). Can be changed at runtime (startup arg / env var / builtin).
+static ENV_PERIOD: AtomicU32 = AtomicU32::new(2);
 
 // =====================
 // メモリマップ規約(①)
@@ -31,6 +32,14 @@ pub struct TickResult {
     pub policy_bits: u32,
 }
 
+pub fn get_env_period() -> u32 {
+    ENV_PERIOD.load(Ordering::Relaxed)
+}
+
+pub fn set_env_period(v: u32) {
+    ENV_PERIOD.store(v.max(1), Ordering::Relaxed);
+}
+
 // ---- I/O collision guard ----
 pub fn guard_io_xyz(mut p: (i32, i32, i32)) -> (i32, i32, i32) {
     if p.0 >= 0 && p.0 < PROG_MAX {
@@ -43,7 +52,7 @@ pub fn guard_io_pair(
     io_in: (i32, i32, i32),
     io_out: (i32, i32, i32),
 ) -> ((i32, i32, i32), (i32, i32, i32)) {
-    let mut a = guard_io_xyz(io_in);
+    let a = guard_io_xyz(io_in);
     let mut b = guard_io_xyz(io_out);
 
     if a.0 == b.0 {
@@ -61,6 +70,9 @@ fn load_program_into_space(space: &mut ComputeSpace, prog: &[u32]) {
     for (i, &inst) in prog.iter().enumerate() {
         space.write_cell_bits(i as i32, 0, 0, 0, inst);
     }
+}
+pub fn now_tick() -> u64 {
+    AI_TICK.load(std::sync::atomic::Ordering::Relaxed) as u64
 }
 
 // =====================
@@ -89,24 +101,29 @@ pub fn ai_tick_core(
         .get_mut(&ag.cpu_handle)
         .ok_or_else(|| SiggError::runtime("cpu state not found".to_string()))?;
 
-    // I/O は固定（以前の成功配置）
+    // ①：io guard を強制（agentにも書き戻す）
+    // let (io_in, io_out) = guard_io_pair(ag.io_in, ag.io_out);
+    // ag.io_in = io_in;
+    // ag.io_out = io_out;
     let io_in  = (100, 0, 0);
     let io_out = (101, 0, 0);
-    let policy_cell = (102, 0, 0);
 
     // tick/env
     let tick = AI_TICK.fetch_add(1, Ordering::Relaxed);
-    let env_bit: u32 = (tick / ENV_PERIOD) % 2;
+    let env_bit: u32 = (tick / get_env_period()) % 2;
 
-    // === 入力 ===
-    // まずはデバッグ優先で固定（self-feedback をやめる）
-    let in_bits: u32 = 0;
+    // cells
+    let policy_cell = (102, 0, 0);
+    let mode_cell   = (io_out.0 + 2, io_out.1, io_out.2);
+
+    // まず CPU が読む入力を先に用意する
+    space.write_cell_bits(policy_cell.0, policy_cell.1, policy_cell.2, 0, env_bit); // ★ここが重要
+    space.write_cell_bits(mode_cell.0, mode_cell.1, mode_cell.2, 0, ag.mode);
+
+    // self-feedback
+    let last_out = space.read_cell_bits(io_out.0, io_out.1, io_out.2, 0);
+    let in_bits = last_out;
     space.write_cell_bits(io_in.0, io_in.1, io_in.2, 0, in_bits);
-
-    // === 重要：policy(=102) を必ず更新 ===
-    // env_bit をそのまま policy_bits に入れる（0/1）
-    let policy_bits: u32 = env_bit & 1;
-    space.write_cell_bits(policy_cell.0, policy_cell.1, policy_cell.2, 0, policy_bits);
 
     // CPU実行
     cpu.pc = 0;
@@ -117,12 +134,13 @@ pub fn ai_tick_core(
     }
 
     // 出力回収
-    let out_bits = space.read_cell_bits(io_out.0, io_out.1, io_out.2, 0);
+    let out_bits    = space.read_cell_bits(io_out.0, io_out.1, io_out.2, 0);
+    let policy_bits = space.read_cell_bits(policy_cell.0, policy_cell.1, policy_cell.2, 0);
 
-    // === 期待値 ===
-    // CPUの計算式に一致：out = in + (policy_bits&1) + 1
-    let expect = in_bits.wrapping_add((policy_bits & 1).wrapping_add(1));
+    // ★期待値は env_bit（=policy_bits）で変える
+    let expect = in_bits.wrapping_add(1 + (policy_bits & 1));
     let ok = out_bits == expect;
+
 
     // === EWMA 更新 ===
     let mut mu = f32::from_bits(ag.score_mu_bits);
@@ -131,7 +149,8 @@ pub fn ai_tick_core(
     mu = mu * (1.0 - beta) + score_now * beta;
     ag.score_mu_bits = mu.to_bits();
 
-    // mode（とりあえず維持でもOK。必要なら以前の閾値制御）
+    // mode 更新（最小・確実）
+    // 失敗したら次tickで policy反転させるため mode=1
     if !ok {
         ag.mode = 1;
     } else if mu > 0.6 {
@@ -151,7 +170,6 @@ pub fn ai_tick_core(
     })
 }
 
-
 // =====================
 // 共通 ai_create_core（統合のため）
 // ※いまの your builtins/server の create と置き換え可能
@@ -166,34 +184,37 @@ pub fn ai_create_core(
     compute_size: i32,
     lanes: usize,
 ) -> Result<u64, SiggError> {
-    // space
+    // space id
     let space_id = st.compute_next_id;
     st.compute_next_id = st.compute_next_id.wrapping_add(1);
 
+    // ★ まず space を作る
     let mut space = ComputeSpace::new_blank(compute_size.max(64), lanes.max(1));
     space.world = world;
     space.space_id = space_id;
-    st.compute_spaces.insert(space_id, space.clone());
 
-    // --- CPUプログラムをアセンブルしてロード（旧ai_create互換：100/101/102固定）
+    // ★ CPUプログラムをアセンブル
     let src = r#"
     loop:
-        LOAD  r1, r0, 100      // r1 = in_bits
-        LOAD  r2, r0, 102      // r2 = policy_bits
+        LOAD  r1, r0, 100
+        LOAD  r2, r0, 102
         MOVI  r3, 1
-        AND   r2, r2, r3       // r2 = policy_id (0 or 1)
+        AND   r2, r2, r3
         MOVI  r4, 1
-        ADD   r2, r2, r4       // r2 = policy_id + 1
-        ADD   r1, r1, r2       // r1 = in_bits + (policy_id+1)
-        STORE r1, r0, 101      // out_bits
+        ADD   r2, r2, r4
+        ADD   r1, r1, r2
+        STORE r1, r0, 101
         JMP   loop
     "#;
 
     let prog = crate::pocket::asm::assemble(src)
         .map_err(|e| SiggError::runtime(format!("assemble failed: {e}")))?;
 
-    // これが旧ai_createの「命令を空間へ書く」要
+    // ★ 先に命令を書き込む（ここが重要）
     load_program_into_space(&mut space, &prog);
+
+    // ★ 命令ロード後の space を insert（clone 不要）
+    st.compute_spaces.insert(space_id, space);
 
 
     // cpu

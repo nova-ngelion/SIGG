@@ -1,4 +1,3 @@
-
 use crate::error::SiggError;
 use crate::span::Span;
 use crate::token::{Tok, Token};
@@ -6,11 +5,12 @@ use crate::token::{Tok, Token};
 pub struct Lexer<'a> {
     src: &'a str,
     i: usize,
+    line: usize,
 }
 
 impl<'a> Lexer<'a> {
     pub fn new(src: &'a str) -> Self {
-        Self { src, i: 0 }
+        Self { src, i: 0, line: 1 }
     }
 
     fn peek(&self) -> Option<char> {
@@ -19,6 +19,7 @@ impl<'a> Lexer<'a> {
 
     fn bump(&mut self) -> Option<char> {
         let c = self.peek()?;
+        if c == '\n' { self.line += 1; }
         self.i += c.len_utf8();
         Some(c)
     }
@@ -56,9 +57,20 @@ impl<'a> Lexer<'a> {
             "repeat" => Tok::Repeat,
             "transition" => Tok::Transition,
             "print" => Tok::Print,
+            "if" => Tok::If, // 新しいキーワーチE if
+            "else" => Tok::Else, // 新しいキーワーチE else
+            "return" => Tok::Return, // 新しいキーワーチE return
+            "import" => Tok::Import, // 新しいキーワーチE import
+            "struct" => Tok::Struct,
+            "enum" => Tok::Enum,
+            "macro" => Tok::Macro,
+            "as" => Tok::As,
+            "fn" => Tok::Fn,
+            "event" => Tok::Event,
+            "when" => Tok::When,
             _ => Tok::Ident(s.to_string()),
         };
-        Token { kind, span: Span::new(start, end) }
+        Token { kind, span: Span::new(start, end, self.line) }
     }
 
     fn lex_number(&mut self, start: usize) -> Result<Token, SiggError> {
@@ -76,7 +88,7 @@ impl<'a> Lexer<'a> {
         let end = self.i;
         let s = &self.src[start..end];
         let n: f64 = s.parse().map_err(|_| SiggError::parse(format!("invalid number: {s}")))?;
-        Ok(Token { kind: Tok::Number(n), span: Span::new(start, end) })
+        Ok(Token { kind: Tok::Number(n), span: Span::new(start, end, self.line) })
     }
 
     fn lex_string(&mut self, start: usize) -> Result<Token, SiggError> {
@@ -86,7 +98,7 @@ impl<'a> Lexer<'a> {
             match c {
                 '"' => {
                     let end = self.i;
-                    return Ok(Token { kind: Tok::Str(out), span: Span::new(start, end) });
+                    return Ok(Token { kind: Tok::Str(out), span: Span::new(start, end, self.line) });
                 }
                 '\\' => {
                     let esc = self.bump().ok_or_else(|| SiggError::parse("unterminated string"))?;
@@ -113,17 +125,69 @@ impl<'a> Lexer<'a> {
         };
 
         let tok = match c {
-            '(' => Token { kind: Tok::LParen, span: Span::new(start, self.i) },
-            ')' => Token { kind: Tok::RParen, span: Span::new(start, self.i) },
-            '{' => Token { kind: Tok::LBrace, span: Span::new(start, self.i) },
-            '}' => Token { kind: Tok::RBrace, span: Span::new(start, self.i) },
-            ',' => Token { kind: Tok::Comma, span: Span::new(start, self.i) },
-            ';' => Token { kind: Tok::Semi, span: Span::new(start, self.i) },
-            '=' => Token { kind: Tok::Eq, span: Span::new(start, self.i) },
-            '+' => Token { kind: Tok::Plus, span: Span::new(start, self.i) },
-            '-' => Token { kind: Tok::Minus, span: Span::new(start, self.i) },
-            '*' => Token { kind: Tok::Star, span: Span::new(start, self.i) },
-            '/' => Token { kind: Tok::Slash, span: Span::new(start, self.i) },
+            '(' => Token { kind: Tok::LParen, span: Span::new(start, self.i, self.line) },
+            ')' => Token { kind: Tok::RParen, span: Span::new(start, self.i, self.line) },
+            '{' => Token { kind: Tok::LBrace, span: Span::new(start, self.i, self.line) },
+            '}' => Token { kind: Tok::RBrace, span: Span::new(start, self.i, self.line) },
+            '[' => Token { kind: Tok::LBracket, span: Span::new(start, self.i, self.line) },
+            ']' => Token { kind: Tok::RBracket, span: Span::new(start, self.i, self.line) },
+            ',' => Token { kind: Tok::Comma, span: Span::new(start, self.i, self.line) },
+            ';' => Token { kind: Tok::Semi, span: Span::new(start, self.i, self.line) },
+            ':' => Token { kind: Tok::Colon, span: Span::new(start, self.i, self.line) },
+            '.' => Token { kind: Tok::Dot, span: Span::new(start, self.i, self.line) },
+            '!' => {
+                if self.peek() == Some('=') {
+                    self.bump();
+                    Token { kind: Tok::Neq, span: Span::new(start, self.i, self.line) } // !=
+                } else {
+                    return Err(SiggError::parse(format!("unexpected char: {c:?}")));
+                }
+            }
+            '&' => {
+                if self.peek() == Some('&') {
+                    self.bump();
+                    Token { kind: Tok::And, span: Span::new(start, self.i, self.line) } // &&
+                } else {
+                    Token { kind: Tok::Amp, span: Span::new(start, self.i, self.line) } // &
+                }
+            }
+            '|' => {
+                if self.peek() == Some('|') {
+                    self.bump();
+                    Token { kind: Tok::Or, span: Span::new(start, self.i, self.line) } // ||
+                } else {
+                    Token { kind: Tok::Pipe, span: Span::new(start, self.i, self.line) } // |
+                }
+            }
+            '=' => {
+                if self.peek() == Some('=') {
+                    self.bump();
+                    Token { kind: Tok::EqEq, span: Span::new(start, self.i, self.line) } // ==
+                } else {
+                    Token { kind: Tok::Eq, span: Span::new(start, self.i, self.line) }
+                }
+            }
+            '<' => {
+                if self.peek() == Some('=') {
+                    self.bump();
+                    Token { kind: Tok::Le, span: Span::new(start, self.i, self.line) } // <=
+                } else {
+                    Token { kind: Tok::Lt, span: Span::new(start, self.i, self.line) } // <
+                }
+            }
+            '>' => {
+                if self.peek() == Some('=') {
+                    self.bump();
+                    Token { kind: Tok::Ge, span: Span::new(start, self.i, self.line) } // >=
+                } else {
+                    Token { kind: Tok::Gt, span: Span::new(start, self.i, self.line) } // >
+                }
+            }
+            '+' => Token { kind: Tok::Plus, span: Span::new(start, self.i, self.line) },
+            '-' => Token { kind: Tok::Minus, span: Span::new(start, self.i, self.line) },
+            '*' => Token { kind: Tok::Star, span: Span::new(start, self.i, self.line) },
+            '/' => Token { kind: Tok::Slash, span: Span::new(start, self.i, self.line) },
+            '%' => Token { kind: Tok::Percent, span: Span::new(start, self.i, self.line) },
             '"' => return Ok(Some(self.lex_string(start)?)),
             c if c.is_ascii_digit() => return Ok(Some(self.lex_number(start)?)),
             c if c.is_alphabetic() || c == '_' => return Ok(Some(self.lex_ident_or_kw(start))),

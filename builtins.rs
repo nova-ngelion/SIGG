@@ -4,19 +4,21 @@ use rayon::prelude::*;
 use std::sync::{Mutex, OnceLock};
 use crate::error::SiggError;
 use crate::value::{Boundary, Grid, GridRef, Value};
+use crate::vm::as_string;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use crate::pocket;
 use crate::pocket::types::{WorldKey, ChunkKey, Hit};
 use crate::state::PocketState;
 use crate::pocket::PocketWorld;
 use crate::pocket::compute::ComputeSpace;
-use crate::pocket::cpu::{CpuState, cpu_run_mem};
-use crate::state::SiggAgent;
 use crate::ai_runtime;
+use std::collections::HashMap;
+use std::time::Instant;
 
+#[allow(dead_code)]
 const PROG_MAX: i32 = 64;   // 命令領域は 0..63
+#[allow(dead_code)]
 const IO_BASE:  i32 = 100;  // io_in/io_out はここ以降へ
-const ENV_PERIOD: u32 = 30; // 30tickごとに正解が変わる（好みで調整）
 
 
 
@@ -27,6 +29,7 @@ pub struct Builtin {
 }
 
 static LAST_DIGEST: AtomicU64 = AtomicU64::new(0);
+#[allow(dead_code)]
 static AI_TICK: AtomicU32 = AtomicU32::new(0);//new
 
 pub fn last_digest_u32() -> u32 {
@@ -215,6 +218,7 @@ fn as_u32(v: &Value) -> Result<u32, SiggError> {
     Ok(n as u32)
 }
 fn as_i32(v: &Value) -> Result<i32, SiggError> { Ok(as_f64(v)? as i32) }
+#[allow(dead_code)]
 fn as_worldkey3(args: &Vec<Value>, i: usize) -> Result<WorldKey, SiggError> {
     Ok((as_u32(&args[i])?, as_u32(&args[i+1])?, as_u32(&args[i+2])?))
 }
@@ -224,11 +228,13 @@ fn worlds() -> &'static Mutex<Vec<pocket::PocketWorld>> {
 fn atlases() -> &'static Mutex<Vec<pocket::Atlas>> {
     ATLASES.get_or_init(|| Mutex::new(Vec::new()))
 }
+#[allow(dead_code)]
 fn world_get_mut(h: u32) -> Result<std::sync::MutexGuard<'static, Vec<pocket::PocketWorld>>, SiggError> {
     let g = worlds().lock().map_err(|_| SiggError::runtime("world registry poisoned"))?;
     if h as usize >= g.len() { return Err(SiggError::runtime("invalid world handle")); }
     Ok(g)
 }
+#[allow(dead_code)]
 fn atlas_get_mut(h: u32) -> Result<std::sync::MutexGuard<'static, Vec<pocket::Atlas>>, SiggError> {
     let g = atlases().lock().map_err(|_| SiggError::runtime("atlas registry poisoned"))?;
     if h as usize >= g.len() { return Err(SiggError::runtime("invalid atlas handle")); }
@@ -292,6 +298,7 @@ fn hits_to_value(hits: Vec<Hit>) -> Value {
     }
     Value::Tuple(out)
 }
+#[allow(dead_code)]
 fn guard_io_xyz(mut p: (i32,i32,i32)) -> (i32,i32,i32) {
     // 命令領域(0..PROG_MAX-1)への衝突を防ぐ
     if p.0 >= 0 && p.0 < PROG_MAX {
@@ -299,8 +306,9 @@ fn guard_io_xyz(mut p: (i32,i32,i32)) -> (i32,i32,i32) {
     }
     p
 }
+#[allow(dead_code)]
 fn guard_io_pair(io_in: (i32,i32,i32), io_out: (i32,i32,i32)) -> ((i32,i32,i32),(i32,i32,i32)) {
-    let mut a = guard_io_xyz(io_in);
+    let a = guard_io_xyz(io_in);
     let mut b = guard_io_xyz(io_out);
 
     // io_in と io_out が同じxにならないよう最低限ずらす
@@ -343,6 +351,7 @@ fn value_to_hits(v: &Value) -> Result<Vec<Hit>, SiggError> {
         _ => Err(SiggError::runtime("expected hits tuple")),
     }
 }
+#[allow(dead_code)]
 fn load_program_into_space(space: &mut ComputeSpace, prog: &[u32]) {
     for (i, &inst) in prog.iter().enumerate() {
         space.write_cell_bits(i as i32, 0, 0, 0, inst);
@@ -350,15 +359,153 @@ fn load_program_into_space(space: &mut ComputeSpace, prog: &[u32]) {
 }
 // ---------- basic builtins ----------
 fn builtin_print(args: Vec<Value>) -> Result<Value, SiggError> {
-    for v in args {
-        println!("{v}");
-        if let Value::Grid(g) = &v {
+    if args.is_empty() {
+        println!();
+        return Ok(Value::Unit);
+    }
+    let (level, rest) = if let Some(Value::Str(s)) = args.first() {
+        if matches!(s.as_str(), "debug" | "info" | "warn" | "error") {
+            (Some(s.as_str()), &args[1..])
+        } else {
+            (None, &args[..])
+        }
+    } else {
+        (None, &args[..])
+    };
+    let print_fn = match level {
+        Some("debug") => |s: &str| eprintln!("[DEBUG] {}", s),
+        Some("info") => |s: &str| println!("[INFO] {}", s),
+        Some("warn") => |s: &str| eprintln!("[WARN] {}", s),
+        Some("error") => |s: &str| eprintln!("[ERROR] {}", s),
+        _ => |s: &str| println!("{}", s),
+    };
+    if let Some(Value::Str(fmt)) = rest.first() {
+        // フォーマット文字列として扱う
+        let mut output = String::new();
+        let mut arg_iter = rest.iter().skip(1);
+        let mut chars = fmt.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if ch == '{' && chars.peek() == Some(&'}') {
+                chars.next();
+                if let Some(arg) = arg_iter.next() {
+                    output.push_str(&format!("{}", arg));
+                } else {
+                    return Err(SiggError::runtime("not enough arguments for format"));
+                }
+            } else {
+                output.push(ch);
+            }
+        }
+        if arg_iter.next().is_some() {
+            return Err(SiggError::runtime("too many arguments for format"));
+        }
+        print_fn(&output);
+    } else {
+        // スペース区切り
+        let mut output = String::new();
+        for (i, arg) in rest.iter().enumerate() {
+            if i > 0 { output.push(' '); }
+            output.push_str(&format!("{}", arg));
+        }
+        print_fn(&output);
+    }
+    for arg in &args {
+        if let Value::Grid(g) = arg {
             let d = digest_grid_u32(g.as_ref());
             LAST_DIGEST.store(d as u64, Ordering::Relaxed);
         }
     }
     Ok(Value::Unit)
 }
+
+fn builtin_vec_get(args: Vec<Value>) -> Result<Value, SiggError> {
+    need_n(&args, 2, "vec_get")?;
+    match &args[0] {
+        Value::Vec(v) => {
+            let idx = as_usize(&args[1])?;
+            v.get(idx).cloned().ok_or_else(|| SiggError::runtime("vec index out of bounds"))
+        }
+        _ => Err(SiggError::runtime("vec_get expects vec and index")),
+    }
+}
+
+fn builtin_vec_set(args: Vec<Value>) -> Result<Value, SiggError> {
+    need_n(&args, 3, "vec_set")?;
+    match &args[0] {
+        Value::Vec(v) => {
+            let idx = as_usize(&args[1])?;
+            if idx >= v.len() {
+                return Err(SiggError::runtime("vec index out of bounds"));
+            }
+            // Note: Vec is immutable in current design, return new vec
+            let mut new_v = v.clone();
+            new_v[idx] = args[2].clone();
+            Ok(Value::Vec(new_v))
+        }
+        _ => Err(SiggError::runtime("vec_set expects vec, index, value")),
+    }
+}
+
+fn builtin_map_get(args: Vec<Value>) -> Result<Value, SiggError> {
+    need_n(&args, 2, "map_get")?;
+    match &args[0] {
+        Value::Map(m) => {
+            let key = as_string(&args[1])?;
+            m.get(&key).cloned().ok_or_else(|| SiggError::runtime("map key not found"))
+        }
+        _ => Err(SiggError::runtime("map_get expects map and key")),
+    }
+}
+
+fn builtin_map_set(args: Vec<Value>) -> Result<Value, SiggError> {
+    need_n(&args, 3, "map_set")?;
+    match &args[0] {
+        Value::Map(m) => {
+            let key = as_string(&args[1])?;
+            let mut new_m = m.clone();
+            new_m.insert(key, args[2].clone());
+            Ok(Value::Map(new_m))
+        }
+        _ => Err(SiggError::runtime("map_set expects map, key, value")),
+    }
+}
+
+fn builtin_vec_new(_args: Vec<Value>) -> Result<Value, SiggError> {
+    Ok(Value::Vec(Vec::new()))
+}
+
+fn builtin_map_new(_args: Vec<Value>) -> Result<Value, SiggError> {
+    Ok(Value::Map(HashMap::new()))
+}
+
+fn builtin_vec_push(args: Vec<Value>) -> Result<Value, SiggError> {
+    need_n(&args, 2, "vec_push")?;
+    match &args[0] {
+        Value::Vec(v) => {
+            let mut new_v = v.clone();
+            new_v.push(args[1].clone());
+            Ok(Value::Vec(new_v))
+        }
+        _ => Err(SiggError::runtime("vec_push expects vec and value")),
+    }
+}
+
+fn builtin_vec_len(args: Vec<Value>) -> Result<Value, SiggError> {
+    need_n(&args, 1, "vec_len")?;
+    match &args[0] {
+        Value::Vec(v) => Ok(Value::F32(v.len() as f32)),
+        _ => Err(SiggError::runtime("vec_len expects vec")),
+    }
+}
+
+fn builtin_map_len(args: Vec<Value>) -> Result<Value, SiggError> {
+    need_n(&args, 1, "map_len")?;
+    match &args[0] {
+        Value::Map(m) => Ok(Value::F32(m.len() as f32)),
+        _ => Err(SiggError::runtime("map_len expects map")),
+    }
+}
+
 // noise2(w,h,seed) -> grid 0..1 (hash-based, coordinate deterministic)
 fn builtin_noise2(args: Vec<Value>) -> Result<Value, SiggError> {
     need_n(&args, 3, "noise2")?;
@@ -538,138 +685,23 @@ fn builtin_ai_pocket_read_f32(args: Vec<Value>) -> Result<Value, SiggError> {
     let p = st.pockets.get_mut(&h).ok_or_else(|| SiggError::runtime("bad pocket handle"))?;
     Ok(Value::F32(p.cell_read_f32(x,y,z,lane)))
 }
-// fn builtin_ai_create(args: Vec<Value>) -> Result<Value, SiggError> {
-//     // ai_create(pocket_h, u,v,w, space_size, lanes) -> (agent_id, space_id, cpu_h)
-//     need_n(&args, 6, "ai_create")?;
-//     let pocket_h = as_u32(&args[0])?;
-//     let world = as_worldkey3(&args, 1)?;
-//     let space_size = as_usize(&args[4])?;
-//     let lanes = as_usize(&args[5])?;
-
-//     let orig_in = (0,0,0);
-//     let orig_out = (1,0,0);
-//     let (io_in, io_out) = guard_io_pair(orig_in, orig_out);
-//     if io_in != orig_in || io_out != orig_out {
-//         eprintln!("[AI] io relocated: in={orig_in:?}->{io_in:?}, out={orig_out:?}->{io_out:?}");
-//     }
-//     let pocket_in_addr    = (0,0,0);
-//     let pocket_out_addr   = (1,0,0);
-//     let pocket_score_addr = (2,0,0);
-//     let pocket_policy_addr= (3,0,0);
-
-//     let mut st = ai_state().lock().map_err(|_| SiggError::runtime("ai_state poisoned"))?;
-
-//     // pocket存在確認 + world一致確認
-//     {
-//         let p = st.pockets.get(&pocket_h).ok_or_else(|| SiggError::runtime("bad pocket handle"))?;
-//         if p.world != world {
-//             return Err(SiggError::runtime("ai_create: world mismatch"));
-//         }
-//     }
-
-//     // ComputeSpace 作成
-//     let space_id = st.next_space_id;
-//     st.next_space_id += 1;
-//     let mut space = ComputeSpace::new_blank(space_size as i32, lanes);
-
-//     // server.rs と同じ命令ロード（あなたが server で成功させたのと同一にする）
-//     let src = r#"
-//     loop:
-//         // mode が 1 なら policy を反転（LSBだけ使う）
-//         LOAD  r5, r0, 103       // r5 = mode
-//         BRZ   r5, cont          // mode==0ならスキップ
-//         LOAD  r2, r0, 102       // r2 = policy_bits
-//         MOVI  r3, 1
-//         XOR   r2, r2, r3        // r2 ^= 1
-//         STORE r2, r0, 102       // policy更新
-
-//     cont:
-//         // out = in + (policy&1) + 1
-//         LOAD  r1, r0, 100       // in
-//         LOAD  r2, r0, 102       // policy
-//         MOVI  r3, 1
-//         AND   r2, r2, r3        // policy_id = policy&1
-//         MOVI  r4, 1
-//         ADD   r2, r2, r4        // policy_id+1
-//         ADD   r1, r1, r2        // in + (policy_id+1)
-//         STORE r1, r0, 101       // out
-//         JMP   loop
-//     "#;
-
-//     let prog = crate::pocket::asm::assemble(src)
-//         .map_err(|e| SiggError::runtime(format!("assemble failed: {e}")))?;
-//     load_program_into_space(&mut space, &prog);
-
-//     st.compute_spaces.insert(space_id, space);
-
-
-//     // CPU 作成
-//     let cpu_h = st.next_handle;
-//     st.next_handle += 1;
-//     st.cpu_states.insert(cpu_h, CpuState::new(world));
-
-//     // Agent 作成
-//     let agent_id = st.next_agent_id;
-//     st.next_agent_id += 1;
-
-//     st.agents.insert(agent_id, SiggAgent {
-//         id: agent_id,
-//         world,
-//         pocket_handle: pocket_h,
-//         space_id,
-//         cpu_handle: cpu_h,
-//         sensors_flags: 0,
-//         sensors_coords: vec![],
-//         io_in,
-//         io_out,
-//         pocket_in_addr,
-//         pocket_out_addr,
-//         pocket_score_addr,
-//         pocket_policy_addr,
-//         score_mu_bits: 0.0f32.to_bits(),
-//         score_beta: 0.20,
-//         mode: 0,
-//     });
-
-//     Ok(Value::Tuple(vec![
-//         Value::Number(agent_id as f64),
-//         Value::Number(space_id as f64),
-//         Value::Number(cpu_h as f64),
-//     ]))
-// }
 fn builtin_ai_create(args: Vec<Value>) -> Result<Value, SiggError> {
-    // 以前のSIGGプログラム互換：ai_create(pocket) の1引数
     need_n(&args, 1, "ai_create")?;
     let pocket_h = as_f64(&args[0])? as u32;
-
-    // 命令領域(0..63)と衝突しないI/O（以前成功した100番台）
-    let io_in:  (i32,i32,i32) = (100, 0, 0);
-    let io_out: (i32,i32,i32) = (101, 0, 0);
-    let score_beta: f32 = 0.20;
-
-    // デフォルト（必要ならSIGG側で別builtin作って可変にしてOK）
-    let space_size: i32 = 1024;
-    let lanes: usize = 1;
 
     let mut st = ai_state()
         .lock()
         .map_err(|_| SiggError::runtime("ai_state poisoned"))?;
 
-    // pocket から world を取得して整合させる
-    let p = st.pockets
-        .get(&pocket_h)
-        .ok_or_else(|| SiggError::runtime("bad pocket handle"))?;
-    let world = p.world; // (u,v,w)
-
-    let agent_id: u64 = crate::ai_runtime::ai_create_core(
+    let agent_id = crate::ai_runtime::ai_create_core(
         &mut st,
-        world,
+        (0, 0, 0),
         pocket_h,
-        io_in,
-        io_out,
-        score_beta,
-        space_size,
-        lanes,
+        (100, 0, 0),
+        (101, 0, 0),
+        0.20,
+        1024,
+        1,
     )?;
 
     Ok(Value::Number(agent_id as f64))
@@ -686,22 +718,17 @@ fn builtin_ai_tick(args: Vec<Value>) -> Result<Value, SiggError> {
 
     let r = crate::ai_runtime::ai_tick_core(&mut st, agent_id, budget)?;
 
-    // ログ（SIGG側printと二重になるなら消してOK）
-    println!("mu=\n{}\nmode=\n{}", r.mu, r.mode);
-    println!(
-        "tick=\n{}\nenv=\n{}\nin=\n{}\nout=\n{}\nexp=\n{}\nok=\n{}",
-        r.tick,
-        r.env_bit,
-        r.in_bits,
-        r.out_bits,
-        r.expect,
-        if r.ok { 1 } else { 0 }
-    );
+    // デバッグ表示（好きなら維持）
+    // println!("mu=\n{}\nmode=\n{}", r.mu, r.mode);
+    // println!("tick=\n{}\nenv=\n{}\nin=\n{}\nout=\n{}\nexp=\n{}\nok=\n{}",
+    //     r.tick, r.env_bit, r.in_bits, r.out_bits, r.expect, if r.ok {1} else {0}
+    // );
 
-    // SIGGプログラムの destructuring と一致させる（8要素）
+    // ★ SIGG 側が期待している 8 要素
     Ok(Value::Tuple(vec![
         Value::Number(r.tick as f64),
         Value::Number(r.env_bit as f64),
+        Value::Number(r.policy_bits as f64),
         Value::Number(r.in_bits as f64),
         Value::Number(r.out_bits as f64),
         Value::Number(r.expect as f64),
@@ -709,6 +736,16 @@ fn builtin_ai_tick(args: Vec<Value>) -> Result<Value, SiggError> {
         Value::Number(r.mu as f64),
         Value::Number(r.mode as f64),
     ]))
+}
+// ai_now_tick(agent) -> Number (u64相当)
+fn builtin_ai_now_tick(args: Vec<Value>) -> Result<Value, SiggError> {
+    // agent は将来拡張用。現状はグローバルtickを返すだけ。
+    if args.len() != 1 {
+        return Err(SiggError::runtime("ai_now_tick(agent): expected 1 arg"));
+    }
+    let _agent = &args[0];
+    let t: u64 = ai_runtime::now_tick(); // ← ai_runtime 側に関数を足す（下に差分）
+    Ok(Value::Number(t as f64))
 }
 
 fn builtin_ai_get_score(args: Vec<Value>) -> Result<Value, SiggError> {
@@ -725,11 +762,183 @@ fn builtin_ai_get_mode(args: Vec<Value>) -> Result<Value, SiggError> {
     let ag = st.agents.get(&agent_id).ok_or_else(|| SiggError::runtime("bad agent"))?;
     Ok(Value::Number(ag.mode as f64))
 }
+
+fn builtin_ai_get_env_period(_args: Vec<Value>) -> Result<Value, SiggError> {
+    Ok(Value::Int(ai_runtime::get_env_period() as i64))
+}
+
+fn builtin_ai_set_env_period(args: Vec<Value>) -> Result<Value, SiggError> {
+    let period = as_u32(&args[0])?;
+    ai_runtime::set_env_period(period);
+    Ok(Value::Unit)
+}
+// ai_get_mu(agent) -> F32 (mu)
+fn builtin_ai_get_mu(args: Vec<Value>) -> Result<Value, SiggError> {
+    // 実体は ai_get_score と同じ（mu の別名）
+    builtin_ai_get_score(args)
+}
 fn need_n(args: &Vec<Value>, n: usize, name: &str) -> Result<(), SiggError> {
     if args.len() != n {
         return Err(SiggError::runtime(format!("{name} expects {n} args")));
     }
     Ok(())
+}
+
+fn builtin_vec_map(args: Vec<Value>) -> Result<Value, SiggError> {
+    if args.len() != 2 {
+        return Err(SiggError::runtime("vec_map expects 2 args: vec, fn"));
+    }
+    
+    let vec = match &args[0] {
+        Value::Vec(v) => v.clone(),
+        _ => return Err(SiggError::runtime("vec_map: first arg must be vec")),
+    };
+    
+    let func = &args[1];
+    
+    let mut result = Vec::new();
+    for item in vec {
+        // ここではシンプルなホスト関数呼び出しを想定
+        // 実際のVM統合では、Lambda/Closureの呼び出しを実装する必要がある
+        match func {
+            Value::HostFunction { func, .. } => {
+                result.push(func(vec![item])?);
+            }
+            Value::Lambda(_) | Value::Closure { .. } => {
+                // VM統合が必要 - ここではプレースホルダー
+                return Err(SiggError::runtime("vec_map: lambda execution requires VM context"));
+            }
+            _ => return Err(SiggError::runtime("vec_map: second arg must be function")),
+        }
+    }
+    
+    Ok(Value::Vec(result))
+}
+
+// filter 関数: vec_filter(vec, predicate) -> vec
+fn builtin_vec_filter(args: Vec<Value>) -> Result<Value, SiggError> {
+    if args.len() != 2 {
+        return Err(SiggError::runtime("vec_filter expects 2 args: vec, predicate"));
+    }
+    
+    let vec = match &args[0] {
+        Value::Vec(v) => v.clone(),
+        _ => return Err(SiggError::runtime("vec_filter: first arg must be vec")),
+    };
+    
+    let func = &args[1];
+    
+    let mut result = Vec::new();
+    for item in vec {
+        let keep = match func {
+            Value::HostFunction { func, .. } => {
+                match func(vec![item.clone()])? {
+                    Value::Bool(b) => b,
+                    _ => return Err(SiggError::runtime("vec_filter: predicate must return bool")),
+                }
+            }
+            _ => return Err(SiggError::runtime("vec_filter: second arg must be function")),
+        };
+        
+        if keep {
+            result.push(item);
+        }
+    }
+    
+    Ok(Value::Vec(result))
+}
+
+// reduce 関数: vec_reduce(vec, initial, reducer) -> value
+fn builtin_vec_reduce(args: Vec<Value>) -> Result<Value, SiggError> {
+    if args.len() != 3 {
+        return Err(SiggError::runtime("vec_reduce expects 3 args: vec, initial, reducer"));
+    }
+    
+    let vec = match &args[0] {
+        Value::Vec(v) => v.clone(),
+        _ => return Err(SiggError::runtime("vec_reduce: first arg must be vec")),
+    };
+    
+    let mut acc = args[1].clone();
+    let func = &args[2];
+    
+    for item in vec {
+        acc = match func {
+            Value::HostFunction { func, .. } => {
+                func(vec![acc, item])?
+            }
+            _ => return Err(SiggError::runtime("vec_reduce: third arg must be function")),
+        };
+    }
+    
+    Ok(acc)
+}
+
+// スナップショット作成
+fn builtin_snapshot_create(args: Vec<Value>) -> Result<Value, SiggError> {
+    let seed = if args.is_empty() {
+        use std::time::SystemTime;
+        SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap().as_secs()
+    } else {
+        match &args[0] {
+            Value::Number(n) => *n as u64,
+            Value::Int(n) => *n as u64,
+            _ => return Err(SiggError::runtime("snapshot_create: seed must be number")),
+        }
+    };
+    
+    Ok(Value::Snapshot {
+        timestamp: Instant::now(),
+        seed,
+        values: args,
+        metadata: HashMap::new(),
+    })
+}
+
+// ログ出力（構造化）
+fn builtin_log(args: Vec<Value>) -> Result<Value, SiggError> {
+    if args.is_empty() {
+        return Ok(Value::Unit);
+    }
+    
+    let level = match &args[0] {
+        Value::Str(s) if matches!(s.as_str(), "debug" | "info" | "warn" | "error") => s.as_str(),
+        _ => "info",
+    };
+    
+    let message = if args.len() > 1 {
+        format!("{}", args[1])
+    } else {
+        format!("{}", args[0])
+    };
+    
+    // 構造化ログとしてJSON形式で出力
+    let log_entry = serde_json::json!({
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+        "level": level,
+        "message": message,
+    });
+    
+    println!("{}", log_entry);
+    Ok(Value::Unit)
+}
+
+// 名前空間作成
+fn builtin_namespace_create(args: Vec<Value>) -> Result<Value, SiggError> {
+    if args.is_empty() {
+        return Err(SiggError::runtime("namespace_create requires name"));
+    }
+    
+    let name = match &args[0] {
+        Value::Str(s) => s.clone(),
+        _ => return Err(SiggError::runtime("namespace_create: name must be string")),
+    };
+    
+    Ok(Value::Namespace {
+        name,
+        members: HashMap::new(),
+    })
 }
 
 //new　↑
@@ -883,6 +1092,15 @@ fn b_world_step_gs(args: Vec<Value>) -> Result<Value, SiggError> {
 pub fn builtins() -> Vec<Builtin> {
     vec![
         Builtin { name: "print", f: builtin_print },
+        Builtin { name: "vec_get", f: builtin_vec_get },
+        Builtin { name: "vec_set", f: builtin_vec_set },
+        Builtin { name: "vec_new", f: builtin_vec_new },
+        Builtin { name: "vec_push", f: builtin_vec_push },
+        Builtin { name: "vec_len", f: builtin_vec_len },
+        Builtin { name: "map_get", f: builtin_map_get },
+        Builtin { name: "map_set", f: builtin_map_set },
+        Builtin { name: "map_new", f: builtin_map_new },
+        Builtin { name: "map_len", f: builtin_map_len },
         Builtin { name: "noise2", f: builtin_noise2 },
         Builtin { name: "rand2", f: builtin_rand2 },
         Builtin { name: "mix", f: builtin_mix },
@@ -906,7 +1124,16 @@ pub fn builtins() -> Vec<Builtin> {
         Builtin { name: "ai_tick", f: builtin_ai_tick },
         Builtin { name: "ai_get_score", f: builtin_ai_get_score },
         Builtin { name: "ai_get_mode", f: builtin_ai_get_mode },
-
+        Builtin { name: "ai_get_env_period", f: builtin_ai_get_env_period },
+        Builtin { name: "ai_set_env_period", f: builtin_ai_set_env_period },
+        Builtin { name: "ai_get_mu",    f: builtin_ai_get_mu },
+        Builtin { name: "ai_now_tick", f: builtin_ai_now_tick },
+        Builtin { name: "vec_map", f: builtin_vec_map },
+        Builtin { name: "vec_filter", f: builtin_vec_filter },
+        Builtin { name: "vec_reduce", f: builtin_vec_reduce },
+        Builtin { name: "snapshot_create", f: builtin_snapshot_create },
+        Builtin { name: "log", f: builtin_log },
+        Builtin { name: "namespace_create", f: builtin_namespace_create },
     
     ]
 }

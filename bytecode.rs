@@ -1,9 +1,10 @@
-
 use std::collections::HashMap;
+use std::fs;
 
 use crate::ast::*;
 use crate::error::SiggError;
 use crate::value::Value;
+use crate::span::Span;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct FnId(pub u16);
@@ -19,18 +20,40 @@ pub enum Op {
     Sub,
     Mul,
     Div,
+    Mod, // %
+    BitAnd, // &
+    Eq, // 新しい演算子: ==
+    Ne, // 新しい演算子: !=
+    Lt, // 新しい演算子: <
+    Gt, // 新しい演算子: >
+    Le, // 新しい演算子: <=
+    Ge, // 新しい演算子: >=
+    And, // 新しい演算子: &&
+    Or,  // 新しい演算子: ||
     Neg,
 
     MakeTuple(u16),
     UnpackTuple(u16), // pop tuple -> push elements (0..n-1)
 
     CallId { id: FnId, argc: u16 },
+    CallLambda { argc: u16 }, // lambda call
+    CallDynamic { argc: u16 }, // dynamic call
     Pop,
     Return,
 
     RepeatInit(u16),
     RepeatCheckJump { slot: u16, off: i32 },
     RepeatDecJump { slot: u16, off: i32 },
+
+    JumpIfFalse { off: i32 }, // 新しい命令: if用
+    Jump { off: i32 }, // 新しい命令: if用
+
+    PushScope, // ブロックスコープ開始
+    PopScope,  // ブロックスコープ終了
+
+    Index, // generic index: stack [.., expr, index] -> [.., value]
+
+    MakeLambda(FnId), // lambda作成
 }
 
 #[derive(Clone, Debug)]
@@ -38,6 +61,29 @@ pub struct Chunk {
     pub ops: Vec<Op>,
     pub consts: Vec<Value>,
     pub local_count: u16,
+}
+
+#[derive(Clone, Debug)]
+pub struct CompiledProgram {
+    pub fns: HashMap<FnId, (Chunk, Span)>,
+    pub table: FnTable,
+    pub main_id: FnId,
+    pub namespaces: HashMap<String, NamespaceInfo>,
+    pub type_info: HashMap<FnId, FunctionTypeInfo>,
+}
+
+#[derive(Clone, Debug)]
+pub struct NamespaceInfo {
+    pub name: String,
+    pub functions: HashMap<String, FnId>,
+    pub structs: HashMap<String, StructDef>,
+    pub enums: HashMap<String, EnumDef>,
+}
+
+#[derive(Clone, Debug)]
+pub struct FunctionTypeInfo {
+    pub params: Vec<TypeAnnotation>,
+    pub ret_type: Option<TypeAnnotation>,
 }
 
 impl Chunk {
@@ -70,23 +116,17 @@ impl FnTable {
     pub fn name(&self, id: FnId) -> &str { &self.id_to_name[id.0 as usize] }
 }
 
-#[derive(Clone, Debug)]
-pub struct CompiledProgram {
-    pub fns: HashMap<FnId, Chunk>,
-    pub table: FnTable,
-    pub main_id: FnId,
-}
-
 struct FnCompiler<'a> {
     locals: HashMap<String, u16>,
     chunk: Chunk,
     table: &'a mut FnTable,
     next_repeat_slot: u16,
+    lambda_fns: Vec<(FnId, Chunk, Span)>,
 }
 
 impl<'a> FnCompiler<'a> {
     fn new(table: &'a mut FnTable) -> Self {
-        Self { locals: HashMap::new(), chunk: Chunk::new(), table, next_repeat_slot: 0 }
+        Self { locals: HashMap::new(), chunk: Chunk::new(), table, next_repeat_slot: 0, lambda_fns: vec![] }
     }
 
     fn alloc_repeat_slot(&mut self) -> u16 {
@@ -103,9 +143,13 @@ impl<'a> FnCompiler<'a> {
         i
     }
 
+    // ★ compile_store_pattern の修正（重複パターンを削除）
     fn compile_store_pattern(&mut self, p: &Pattern) -> Result<(), SiggError> {
         match p {
-            Pattern::Wildcard => { self.chunk.emit(Op::Pop); Ok(()) }
+            Pattern::Wildcard => {
+                self.chunk.emit(Op::Pop);
+                Ok(())
+            }
             Pattern::Name(name) => {
                 let idx = self.local_index(name);
                 self.chunk.emit(Op::StoreLocal(idx));
@@ -121,21 +165,51 @@ impl<'a> FnCompiler<'a> {
                 }
                 Ok(())
             }
+            Pattern::Struct { name: _, fields } => {
+                // 構造体のアンパック
+                // TODO: Op::UnpackStruct を実装
+                for (_field_name, field_pat) in fields {
+                    // 簡易実装: フィールドアクセス命令が必要
+                    self.compile_store_pattern(field_pat)?;
+                }
+                Ok(())
+            }
         }
     }
 
     fn compile_stmt(&mut self, s: &Stmt) -> Result<(), SiggError> {
         match s {
-            Stmt::Let { pat, expr } => {
+            // ★ 修正: type_ann フィールドを追加
+            Stmt::Let { pat, type_ann, expr } => {
+                // type_ann は型チェック時に使用、コンパイル時は無視
+                let _ = type_ann;
                 self.compile_expr(expr)?;
                 self.compile_store_pattern(pat)?;
                 Ok(())
             }
-            Stmt::Assign { name, expr } => {
-                self.compile_expr(expr)?;
-                let idx = self.local_index(name);
-                self.chunk.emit(Op::StoreLocal(idx));
+            Stmt::Block { body } => {
+                self.chunk.emit(Op::PushScope);
+                for st in body { self.compile_stmt(st)?; }
+                self.chunk.emit(Op::PopScope);
                 Ok(())
+            }
+            Stmt::Assign { lhs, expr } => {
+                match lhs {
+                    Expr::Var(name) => {
+                        self.compile_expr(expr)?;
+                        let idx = self.local_index(name);
+                        self.chunk.emit(Op::StoreLocal(idx));
+                        Ok(())
+                    }
+                    Expr::Index { expr: base, index } => {
+                        self.compile_expr(base)?;
+                        self.compile_expr(index)?;
+                        self.compile_expr(expr)?;
+                        // TODO: Op::StoreIndex を実装
+                        Err(SiggError::runtime("indexed assignment not yet implemented"))
+                    }
+                    _ => Err(SiggError::runtime("invalid assignment target"))
+                }
             }
             Stmt::Expr(e) => {
                 self.compile_expr(e)?;
@@ -144,6 +218,124 @@ impl<'a> FnCompiler<'a> {
             }
             Stmt::Repeat { count, body } => self.compile_repeat_like(count, body),
             Stmt::Transition { count, body } => self.compile_repeat_like(count, body),
+            Stmt::If { cond, then_branch, else_branch } => {
+                self.compile_expr(cond)?;
+                let jump_if_false_pos = self.chunk.ops.len();
+                self.chunk.emit(Op::JumpIfFalse { off: 0 });
+                self.chunk.emit(Op::PushScope);
+                for st in then_branch { self.compile_stmt(st)?; }
+                self.chunk.emit(Op::PopScope);
+                let jump_to_end_pos = if else_branch.is_some() {
+                    let pos = self.chunk.ops.len();
+                    self.chunk.emit(Op::Jump { off: 0 });
+                    pos
+                } else { 0 };
+                let else_start = self.chunk.ops.len();
+                if let Some(else_stmts) = else_branch {
+                    self.chunk.emit(Op::PushScope);
+                    for st in else_stmts { self.compile_stmt(st)?; }
+                    self.chunk.emit(Op::PopScope);
+                }
+                let end = self.chunk.ops.len();
+                if let Op::JumpIfFalse { off } = &mut self.chunk.ops[jump_if_false_pos] {
+                    *off = (else_start as i32) - (jump_if_false_pos as i32 + 1);
+                }
+                if else_branch.is_some() {
+                    if let Op::Jump { off } = &mut self.chunk.ops[jump_to_end_pos] {
+                        *off = (end as i32) - (jump_to_end_pos as i32 + 1);
+                    }
+                }
+                Ok(())
+            }
+            Stmt::Return { expr } => {
+                self.compile_expr(expr)?;
+                self.chunk.emit(Op::Return);
+                Ok(())
+            }
+            Stmt::Import { .. } => Ok(()), // importはコンパイル時に処理済み
+            Stmt::StructDef { .. } => Ok(()), // 型定義はコンパイル時に処理済み
+            Stmt::EnumDef { .. } => Ok(()), // 型定義はコンパイル時に処理済み
+            Stmt::MacroDef { .. } => Ok(()), // マクロはコンパイル時に処理済み
+            Stmt::NamespaceDef(_) => Ok(()), // 名前空間はコンパイル時に処理済み
+            Stmt::When { cond, then_branch, else_branch } => {
+                // 実質 If と同じ
+                self.compile_expr(cond)?;
+                let jif_pos = self.chunk.ops.len();
+                self.chunk.emit(Op::JumpIfFalse { off: 0 });
+
+                self.chunk.emit(Op::PushScope);
+                for st in then_branch { self.compile_stmt(st)?; }
+                self.chunk.emit(Op::PopScope);
+
+                let jend_pos = if else_branch.is_some() {
+                    let p = self.chunk.ops.len();
+                    self.chunk.emit(Op::Jump { off: 0 });
+                    p
+                } else { 0 };
+
+                let else_start = self.chunk.ops.len();
+                if let Some(else_stmts) = else_branch {
+                    self.chunk.emit(Op::PushScope);
+                    for st in else_stmts { self.compile_stmt(st)?; }
+                    self.chunk.emit(Op::PopScope);
+                }
+                let end = self.chunk.ops.len();
+
+                if let Op::JumpIfFalse { off } = &mut self.chunk.ops[jif_pos] {
+                    *off = (else_start as i32) - (jif_pos as i32 + 1);
+                }
+                if else_branch.is_some() {
+                    if let Op::Jump { off } = &mut self.chunk.ops[jend_pos] {
+                        *off = (end as i32) - (jend_pos as i32 + 1);
+                    }
+                }
+                Ok(())
+            }
+
+            Stmt::Event { arms, else_branch } => {
+                // event は “else-if チェーン（first match）”
+                // 実装: 각 arm を順に
+                //  cond -> false なら次へ, true なら body 実行して end へジャンプ
+                let mut jump_to_end_positions: Vec<usize> = vec![];
+                let mut pending_jif_positions: Vec<usize> = vec![];
+
+                for (cond, body) in arms {
+                    self.compile_expr(cond)?;
+                    let jif_pos = self.chunk.ops.len();
+                    self.chunk.emit(Op::JumpIfFalse { off: 0 });
+                    pending_jif_positions.push(jif_pos);
+
+                    self.chunk.emit(Op::PushScope);
+                    for st in body { self.compile_stmt(st)?; }
+                    self.chunk.emit(Op::PopScope);
+
+                    let jend_pos = self.chunk.ops.len();
+                    self.chunk.emit(Op::Jump { off: 0 });
+                    jump_to_end_positions.push(jend_pos);
+
+                    // 次の arm の開始位置へ飛ぶように jif をパッチ
+                    let next_start = self.chunk.ops.len();
+                    if let Op::JumpIfFalse { off } = &mut self.chunk.ops[jif_pos] {
+                        *off = (next_start as i32) - (jif_pos as i32 + 1);
+                    }
+                }
+
+                // どれも当たらなかった場合（ここに落ちる）
+                let else_start = self.chunk.ops.len();
+                if let Some(else_stmts) = else_branch {
+                    self.chunk.emit(Op::PushScope);
+                    for st in else_stmts { self.compile_stmt(st)?; }
+                    self.chunk.emit(Op::PopScope);
+                }
+
+                let end = self.chunk.ops.len();
+                for jend_pos in jump_to_end_positions {
+                    if let Op::Jump { off } = &mut self.chunk.ops[jend_pos] {
+                        *off = (end as i32) - (jend_pos as i32 + 1);
+                    }
+                }
+                Ok(())
+            }
         }
     }
 
@@ -156,7 +348,9 @@ impl<'a> FnCompiler<'a> {
         let j_pos = self.chunk.ops.len();
         self.chunk.emit(Op::RepeatCheckJump { slot, off: 0 });
 
+        self.chunk.emit(Op::PushScope); // repeat body scope
         for st in body { self.compile_stmt(st)?; }
+        self.chunk.emit(Op::PopScope);
 
         let jmp_pos = self.chunk.ops.len();
         let back = check_ip as i32 - (jmp_pos as i32 + 1);
@@ -173,63 +367,449 @@ impl<'a> FnCompiler<'a> {
 
     fn compile_expr(&mut self, e: &Expr) -> Result<(), SiggError> {
         match e {
+            Expr::Var(name) => {
+                // 1) ローカルなら読む
+                if let Some(idx) = self.lookup_local(name) {
+                    self.chunk.emit(Op::LoadLocal(idx));
+                    return Ok(());
+                }
+                // 2) 関数名なら関数値として参照（= Lambda(FnId) を積む）
+                if let Some(id) = self.table.name_to_id.get(name).copied() {
+                    let ci = self.chunk.add_const(Value::Lambda(id));
+                    self.chunk.emit(Op::Const(ci));
+                    return Ok(());
+                }
+                // 3) 未定義はエラー（Unit を作らない）
+                Err(SiggError::runtime(format!("undefined variable: {}", name)))
+            }
+            Expr::NamespacedVar { namespace, name } => {
+                let qualified = format!("{}::{}", namespace, name);
+                // 1) ローカルに同名があればローカル（特殊ケース）
+                if let Some(idx) = self.lookup_local(&qualified) {
+                    self.chunk.emit(Op::LoadLocal(idx));
+                    return Ok(());
+                }
+                // 2) 名前空間関数なら関数値
+                if let Some(id) = self.table.name_to_id.get(&qualified).copied() {
+                    let ci = self.chunk.add_const(Value::Lambda(id));
+                    self.chunk.emit(Op::Const(ci));
+                    return Ok(());
+                }
+                Err(SiggError::runtime(format!("undefined namespaced value: {}", qualified)))
+            }
             Expr::Number(n) => {
                 let ci = self.chunk.add_const(Value::Number(*n));
                 self.chunk.emit(Op::Const(ci));
+                Ok(()) // ★ 追加
             }
             Expr::Str(s) => {
                 let ci = self.chunk.add_const(Value::Str(s.clone()));
                 self.chunk.emit(Op::Const(ci));
+                Ok(()) // ★ 追加
             }
-            Expr::Var(name) => {
-                let idx = self.local_index(name);
-                self.chunk.emit(Op::LoadLocal(idx));
+            Expr::Group(inner) => {
+                self.compile_expr(inner)?;
+                Ok(()) // ★ 追加
             }
-            Expr::Group(inner) => self.compile_expr(inner)?,
             Expr::Unary { op, rhs } => {
                 self.compile_expr(rhs)?;
                 match op {
                     UnOp::Neg => self.chunk.emit(Op::Neg),
+                    UnOp::Not => {
+                        // TODO: Op::Not を実装
+                        return Err(SiggError::runtime("Not operator not yet implemented"));
+                    }
                 }
+                Ok(()) // ★ 追加
             }
             Expr::Binary { op, lhs, rhs } => {
-                self.compile_expr(lhs)?;
-                self.compile_expr(rhs)?;
                 match op {
-                    BinOp::Add => self.chunk.emit(Op::Add),
-                    BinOp::Sub => self.chunk.emit(Op::Sub),
-                    BinOp::Mul => self.chunk.emit(Op::Mul),
-                    BinOp::Div => self.chunk.emit(Op::Div),
+                    BinOp::And => {
+                        // (truthy(lhs) && truthy(rhs)) を Bool で返し、rhs は短絡
+                        // 1) lhs
+                        self.compile_expr(lhs)?;
+                        let j_lhs_false = self.chunk.ops.len();
+                        self.chunk.emit(Op::JumpIfFalse { off: 0 }); // pop(lhs); falseなら飛ぶ
+            
+                        // 2) rhs
+                        self.compile_expr(rhs)?;
+                        let j_rhs_false = self.chunk.ops.len();
+                        self.chunk.emit(Op::JumpIfFalse { off: 0 }); // pop(rhs); falseなら飛ぶ
+            
+                        // 3) 両方 truthy -> true
+                        self.emit_bool(true);
+                        let j_end = self.chunk.ops.len();
+                        self.chunk.emit(Op::Jump { off: 0 });
+            
+                        // rhs false ラベル
+                        let rhs_false_ip = self.chunk.ops.len();
+                        self.emit_bool(false);
+                        let j_end2 = self.chunk.ops.len();
+                        self.chunk.emit(Op::Jump { off: 0 });
+            
+                        // lhs false ラベル
+                        let lhs_false_ip = self.chunk.ops.len();
+                        self.emit_bool(false);
+            
+                        // end ラベル
+                        let end_ip = self.chunk.ops.len();
+            
+                        // パッチ
+                        if let Op::JumpIfFalse { off } = &mut self.chunk.ops[j_lhs_false] {
+                            *off = (lhs_false_ip as i32) - (j_lhs_false as i32 + 1);
+                        }
+                        if let Op::JumpIfFalse { off } = &mut self.chunk.ops[j_rhs_false] {
+                            *off = (rhs_false_ip as i32) - (j_rhs_false as i32 + 1);
+                        }
+                        if let Op::Jump { off } = &mut self.chunk.ops[j_end] {
+                            *off = (end_ip as i32) - (j_end as i32 + 1);
+                        }
+                        if let Op::Jump { off } = &mut self.chunk.ops[j_end2] {
+                            *off = (end_ip as i32) - (j_end2 as i32 + 1);
+                        }
+                        Ok(())
+                    }
+            
+                    BinOp::Or => {
+                        // (truthy(lhs) || truthy(rhs)) を Bool で返し、rhs は短絡
+                        // 1) lhs
+                        self.compile_expr(lhs)?;
+                        let j_lhs_false = self.chunk.ops.len();
+                        self.chunk.emit(Op::JumpIfFalse { off: 0 }); // pop(lhs); falseなら rhs 評価へ
+            
+                        // lhs が truthy -> その時点で true（rhs 評価しない）
+                        self.emit_bool(true);
+                        let j_end = self.chunk.ops.len();
+                        self.chunk.emit(Op::Jump { off: 0 });
+            
+                        // rhs 評価ラベル
+                        let rhs_eval_ip = self.chunk.ops.len();
+                        self.compile_expr(rhs)?;
+                        let j_rhs_false = self.chunk.ops.len();
+                        self.chunk.emit(Op::JumpIfFalse { off: 0 }); // pop(rhs); falseなら false
+            
+                        // rhs truthy -> true
+                        self.emit_bool(true);
+                        let j_end2 = self.chunk.ops.len();
+                        self.chunk.emit(Op::Jump { off: 0 });
+            
+                        // rhs false ラベル
+                        let rhs_false_ip = self.chunk.ops.len();
+                        self.emit_bool(false);
+            
+                        // end
+                        let end_ip = self.chunk.ops.len();
+            
+                        // パッチ
+                        if let Op::JumpIfFalse { off } = &mut self.chunk.ops[j_lhs_false] {
+                            *off = (rhs_eval_ip as i32) - (j_lhs_false as i32 + 1);
+                        }
+                        if let Op::JumpIfFalse { off } = &mut self.chunk.ops[j_rhs_false] {
+                            *off = (rhs_false_ip as i32) - (j_rhs_false as i32 + 1);
+                        }
+                        if let Op::Jump { off } = &mut self.chunk.ops[j_end] {
+                            *off = (end_ip as i32) - (j_end as i32 + 1);
+                        }
+                        if let Op::Jump { off } = &mut self.chunk.ops[j_end2] {
+                            *off = (end_ip as i32) - (j_end2 as i32 + 1);
+                        }
+                        Ok(())
+                    }
+                    // それ以外は従来通り（両辺評価）
+                    _ => {
+                        self.compile_expr(lhs)?;
+                        self.compile_expr(rhs)?;
+                        match op {
+                            BinOp::Add => self.chunk.emit(Op::Add),
+                            BinOp::Sub => self.chunk.emit(Op::Sub),
+                            BinOp::Mul => self.chunk.emit(Op::Mul),
+                            BinOp::Div => self.chunk.emit(Op::Div),
+                            BinOp::Mod => self.chunk.emit(Op::Mod),
+                            BinOp::BitAnd => self.chunk.emit(Op::BitAnd),
+                            BinOp::Eq => self.chunk.emit(Op::Eq),
+                            BinOp::Ne => self.chunk.emit(Op::Ne),
+                            BinOp::Lt => self.chunk.emit(Op::Lt),
+                            BinOp::Gt => self.chunk.emit(Op::Gt),
+                            BinOp::Le => self.chunk.emit(Op::Le),
+                            BinOp::Ge => self.chunk.emit(Op::Ge),
+                            BinOp::And => self.chunk.emit(Op::And),
+                            BinOp::Or => self.chunk.emit(Op::Or),
+                        }
+                        Ok(()) // ★ 追加
+                    }
                 }
             }
             Expr::Tuple(items) => {
                 for it in items { self.compile_expr(it)?; }
                 self.chunk.emit(Op::MakeTuple(items.len() as u16));
+                Ok(()) // ★ 追加
             }
             Expr::Call { callee, args } => {
-                for a in args { self.compile_expr(a)?; }
-                let id = self.table.intern(callee);
-                self.chunk.emit(Op::CallId { id, argc: args.len() as u16 });
+                match &**callee {
+                    Expr::Var(name) => {
+                        if is_builtin(name) {
+                            for a in args { self.compile_expr(a)?; }
+                            let id = self.table.intern(name);
+                            self.chunk.emit(Op::CallId { id, argc: args.len() as u16 });
+                            return Ok(());
+                        }
+            
+                        if let Some(fid) = self.table.name_to_id.get(name).copied() {
+                            let ci = self.chunk.add_const(Value::Lambda(fid));
+                            self.chunk.emit(Op::Const(ci));
+                            for a in args { self.compile_expr(a)?; }
+                            self.chunk.emit(Op::CallLambda { argc: args.len() as u16 });
+                            return Ok(());
+                        }
+            
+                        // fallthrough: 値としての関数（変数に入ってる等）
+                        self.compile_expr(&**callee)?;
+                        for a in args { self.compile_expr(a)?; }
+                        self.chunk.emit(Op::CallDynamic { argc: args.len() as u16 });
+                        Ok(())
+                    }
+                    _ => {
+                        // callee が式の場合は常に動的呼び出し
+                        self.compile_expr(&**callee)?;
+                        for a in args { self.compile_expr(a)?; }
+                        self.chunk.emit(Op::CallDynamic { argc: args.len() as u16 });
+                        Ok(())
+                    }
+                }
+            }
+            
+            Expr::If { cond, then_branch, else_branch } => {
+                self.compile_expr(cond)?;
+                let jump_if_false_pos = self.chunk.ops.len();
+                self.chunk.emit(Op::JumpIfFalse { off: 0 });
+                self.compile_expr(then_branch)?;
+                let jump_to_end_pos = if else_branch.is_some() {
+                    let pos = self.chunk.ops.len();
+                    self.chunk.emit(Op::Jump { off: 0 });
+                    pos
+                } else { 0 };
+                let else_start = self.chunk.ops.len();
+                if let Some(else_expr) = else_branch {
+                    self.compile_expr(else_expr)?;
+                }
+                let end = self.chunk.ops.len();
+                if let Op::JumpIfFalse { off } = &mut self.chunk.ops[jump_if_false_pos] {
+                    *off = (else_start as i32) - (jump_if_false_pos as i32 + 1);
+                }
+                if else_branch.is_some() {
+                    if let Op::Jump { off } = &mut self.chunk.ops[jump_to_end_pos] {
+                        *off = (end as i32) - (jump_to_end_pos as i32 + 1);
+                    }
+                }
+                Ok(()) // ★ 追加
+            }
+            Expr::Index { expr, index } => {
+                self.compile_expr(expr)?;
+                self.compile_expr(index)?;
+                self.chunk.emit(Op::Index);
+                Ok(()) // ★ 追加
+            }
+            Expr::Field { expr, name } => {
+                self.compile_expr(expr)?;
+                // TODO: Op::Field を実装
+                let _ = name;
+                Err(SiggError::runtime("field access not yet implemented"))
+            }
+            Expr::Lambda { params, body } => {
+                let lambda_name = format!("lambda_{}", self.table.id_to_name.len());
+                let id = self.table.intern(&lambda_name);
+                let mut lambda_compiler = FnCompiler::new(self.table);
+                
+                for (param_name, _param_type) in params {
+                    lambda_compiler.local_index(param_name);
+                }
+                
+                for stmt in body {
+                    lambda_compiler.compile_stmt(stmt)?;
+                }
+                lambda_compiler.chunk.emit(Op::Return);
+                let span = Span::new(0, 0, 0);
+                self.lambda_fns.push((id, lambda_compiler.chunk, span));
+                self.chunk.emit(Op::MakeLambda(id));
+                Ok(()) // ★ 追加
+            }
+            Expr::StructInit { namespace, name, fields } => {
+                // TODO: Op::MakeStruct を実装
+                let _ = (namespace, name, fields);
+                Err(SiggError::runtime("struct initialization not yet implemented"))
+            }
+            Expr::EnumInit { namespace, enum_name, variant, data } => {
+                // TODO: Op::MakeEnum を実装
+                let _ = (namespace, enum_name, variant, data);
+                Err(SiggError::runtime("enum initialization not yet implemented"))
             }
         }
-        Ok(())
+    }
+    fn lookup_local(&self, name: &str) -> Option<u16> {
+        self.locals.get(name).copied()
+    }
+    fn emit_bool(&mut self, b: bool) {
+        let ci = self.chunk.add_const(Value::Bool(b));
+        self.chunk.emit(Op::Const(ci));
     }
 }
 
+fn is_builtin(name: &str) -> bool {
+    matches!(name, "print" | "vec_get" | "vec_set" | "vec_new" | "vec_push" | "vec_len" | "map_get" | "map_set" | "map_new" | "map_len" | "noise2" | "rand2" | "mix" | "clamp" | "project" | "reaction_gs" | "world_step_gs" | "pocket_open" | "atlas_new" | "pocket_read" | "pocket_write" | "pocket_persist" | "atlas_query_topk" | "pocket_trigger_extract_auto" | "pocket_atlas_update" | "ai_pocket_open" | "ai_pocket_write_f32" | "ai_pocket_read_f32" | "ai_create" | "ai_tick" | "ai_get_score" | "ai_get_mode" | "ai_get_env_period" | "ai_set_env_period" | "ai_get_mu" | "ai_now_tick")
+}
+
+// ★ compile 関数の修正
 pub fn compile(p: &Program) -> Result<CompiledProgram, SiggError> {
-    let mut table = FnTable::new();
-    for f in &p.fns { table.intern(&f.name); }
-
-    let mut fns_map: HashMap<FnId, Chunk> = HashMap::new();
-
-    for f in &p.fns {
-        let id = *table.name_to_id.get(&f.name).unwrap();
-        let mut fc = FnCompiler::new(&mut table);
-        for st in &f.body { fc.compile_stmt(st)?; }
-        fc.chunk.emit(Op::Return);
-        fns_map.insert(id, fc.chunk);
+    let mut all_fns = p.fns.clone();
+    for import_path in &p.imports {
+        let content = fs::read_to_string(import_path)
+            .map_err(|e| SiggError::io(format!("failed to read {}: {}", import_path, e)))?;
+        let mut parser = crate::parser::Parser::new(&content);
+        let imported_prog = parser.parse_program()
+            .map_err(|e| SiggError::parse(format!("in {}: {}", import_path, e)))?;
+        all_fns.extend(imported_prog.fns);
     }
 
-    let main_id = *table.name_to_id.get("main").ok_or_else(|| SiggError::parse("missing fn main()"))?;
-    Ok(CompiledProgram { fns: fns_map, table, main_id })
+    let mut table = FnTable::new();
+    for f in &all_fns { table.intern(&f.name); }
+
+    let mut fns_map: HashMap<FnId, (Chunk, Span)> = HashMap::new();
+    let mut all_lambdas = vec![];
+
+    for f in &all_fns {
+        let id = *table.name_to_id.get(&f.name).unwrap();
+        let mut fc = FnCompiler::new(&mut table);
+        
+        // ★ 修正: params は Vec<(String, Option<TypeAnnotation>)>
+        for (param_name, _param_type) in &f.params {
+            fc.local_index(param_name);
+        }
+        
+        for st in &f.body { fc.compile_stmt(st)?; }
+        fc.chunk.emit(Op::Return);
+        fns_map.insert(id, (fc.chunk, f.span));
+        all_lambdas.extend(fc.lambda_fns);
+    }
+
+    for (id, chunk, span) in all_lambdas {
+        fns_map.insert(id, (chunk, span));
+    }
+
+    let main_id = *table.name_to_id.get("main")
+        .ok_or_else(|| SiggError::parse("missing fn main()"))?;
+    // ★ 修正: 必須フィールドを追加
+    Ok(CompiledProgram { 
+        fns: fns_map, 
+        table, 
+        main_id,
+        namespaces: HashMap::new(),  // ★ 追加
+        type_info: HashMap::new(),   // ★ 追加
+    })
+}
+
+pub fn compile_with_namespaces(p: &Program) -> Result<CompiledProgram, SiggError> {
+    let mut all_fns = p.fns.clone();
+    let mut namespaces: HashMap<String, NamespaceInfo> = HashMap::new();
+    
+    // 名前空間の処理
+    for ns_def in &p.namespaces {
+        let mut ns_info = NamespaceInfo {
+            name: ns_def.name.clone(),
+            functions: HashMap::new(),
+            structs: HashMap::new(),
+            enums: HashMap::new(),
+        };
+        
+        for item in &ns_def.items {
+            match item {
+                NamespaceItem::Function(fn_def) => {
+                    ns_info.functions.insert(fn_def.name.clone(), FnId(0)); // 後で更新
+                    all_fns.push(fn_def.clone());
+                }
+                NamespaceItem::Struct(struct_def) => {
+                    ns_info.structs.insert(struct_def.name.clone(), struct_def.clone());
+                }
+                NamespaceItem::Enum(enum_def) => {
+                    ns_info.enums.insert(enum_def.name.clone(), enum_def.clone());
+                }
+            }
+        }
+        
+        namespaces.insert(ns_def.name.clone(), ns_info);
+    }
+    
+    // インポートの処理
+    for import_path in &p.imports {
+        let content = std::fs::read_to_string(import_path)
+            .map_err(|e| SiggError::io(format!("failed to read {}: {}", import_path, e)))?;
+        let mut parser = crate::parser::Parser::new(&content);
+        let imported_prog = parser.parse_program()
+            .map_err(|e| SiggError::parse(format!("in {}: {}", import_path, e)))?;
+        all_fns.extend(imported_prog.fns);
+    }
+    
+    let mut table = FnTable::new();
+    let mut type_info: HashMap<FnId, FunctionTypeInfo> = HashMap::new();
+    
+    // 関数テーブルの構築
+    for f in &all_fns {
+        let fn_name = if let Some(ns) = &f.namespace {
+            format!("{}::{}", ns, f.name)
+        } else {
+            f.name.clone()
+        };
+        
+        let id = table.intern(&fn_name);
+        
+        // 型情報の保存
+        if !f.params.is_empty() || f.ret_type.is_some() {
+            type_info.insert(id, FunctionTypeInfo {
+                params: f.params.iter()
+                    .filter_map(|(_, ty)| ty.clone())
+                    .collect(),
+                ret_type: f.ret_type.clone(),
+            });
+        }
+    }
+    
+    let mut fns_map: HashMap<FnId, (Chunk, Span)> = HashMap::new();
+    let mut all_lambdas = vec![];
+    
+    for f in &all_fns {
+        let fn_name = if let Some(ns) = &f.namespace {
+            format!("{}::{}", ns, f.name)
+        } else {
+            f.name.clone()
+        };
+        
+        let id = *table.name_to_id.get(&fn_name).unwrap();
+        let mut fc = FnCompiler::new(&mut table);
+        
+        // パラメータを登録
+        for (param_name, _) in &f.params {
+            fc.local_index(param_name);
+        }
+        
+        for st in &f.body {
+            fc.compile_stmt(st)?;
+        }
+        fc.chunk.emit(Op::Return);
+        fns_map.insert(id, (fc.chunk, f.span));
+        all_lambdas.extend(fc.lambda_fns);
+    }
+    
+    for (id, chunk, span) in all_lambdas {
+        fns_map.insert(id, (chunk, span));
+    }
+    
+    let main_id = *table.name_to_id.get("main")
+        .ok_or_else(|| SiggError::parse("missing fn main()"))?;
+    
+    Ok(CompiledProgram {
+        fns: fns_map,
+        table,
+        main_id,
+        namespaces,
+        type_info,
+    })
 }

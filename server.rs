@@ -7,34 +7,36 @@ use std::sync::{
     atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering as AtomicOrdering},
     Arc, Condvar, Mutex,
 };
-use std::sync::atomic::Ordering;
 
 use std::thread;
 use crate::error::SiggError;
 use crate::value::{Boundary, Grid};
 use crate::bytecode;
-use crate::pocket::cpu::{CpuState, cpu_run};
-use crate::state::SiggAgent;
+use crate::pocket::cpu::CpuState;
 use crate::pocket::compute::ComputeSpace;
-use crate::pocket::asm;
 use crate::ai_runtime;
 
 
 // use rayon::prelude::*;
 
+#[allow(dead_code)]
 type Compiled = bytecode::CompiledProgram;
 
 lazy_static::lazy_static! {
     static ref CACHE: Mutex<HashMap<u64, Arc<Compiled>>> = Mutex::new(HashMap::new());
 }
 
+#[allow(dead_code)]
 static AI_TICK: AtomicU32 = AtomicU32::new(0);//new
 
 // ============================
 // V4 protocol (fixed-binary API)
 // ============================
+#[allow(dead_code)]
 const PROG_MAX: i32 = 64;//new
+#[allow(dead_code)]
 const IO_BASE: i32 = 100;//new
+#[allow(dead_code)]
 const ENV_PERIOD: u32 = 30; // 30tickごとに正解が変わる（好みで調整）//new
 
 
@@ -50,6 +52,7 @@ const TAG_POCKET_TRIGGER: u32 = 0x26;
 const TAG_POCKET_OPEN: u32 = 0x27;
 
 const OK: u32 = 0;
+#[allow(dead_code)]
 const ERR: u32 = 1;
 
 // flags (bit)
@@ -77,6 +80,8 @@ const TAG_CPU_ASM_LOAD: u32 = 0x43;
 const TAG_AI_SET_IO: u32 = 0x44;
 const TAG_POCKET_WRITE_F32: u32 = 0x45;
 const TAG_POCKET_READ_F32: u32 = 0x46;
+const TAG_AI_GET_ENV_PERIOD: u32 = 0x47;
+const TAG_AI_SET_ENV_PERIOD: u32 = 0x48;
 
 
 
@@ -119,6 +124,7 @@ enum JobState {
 
 #[derive(Debug)]
 struct Job {
+    #[allow(dead_code)]
     id: u64,
     state: JobState,
     done: u32,
@@ -148,6 +154,7 @@ struct ServerCtx {
 }
 
 #[derive(Clone)]
+#[allow(dead_code)]
 struct JobSpec {
     id: u64,
     topk: u32,
@@ -156,6 +163,7 @@ struct JobSpec {
 }
 
 #[derive(Clone)]
+#[allow(dead_code)]
 struct JobResult {
     // top-k heap (min-heap by score)
     heap: BinaryHeap<Scored>,
@@ -166,6 +174,7 @@ struct JobResult {
 }
 
 #[derive(Clone)]
+#[allow(dead_code)]
 struct Scored {
     score: f32,
     digest: u32,
@@ -337,7 +346,7 @@ fn compute_open(stream: &mut TcpStream, pocket_state: &Arc<Mutex<PocketState>>) 
     // とりあえずデフォルト（後でプロトコルに size/lanes を足してもOK）
     let space_size = read_u32(stream)? as i32;
     let lanes = read_u32(stream)? as usize;
-    let cs = crate::pocket::ComputeSpace::new(world, space_id, space_size, lanes);
+    let _cs = crate::pocket::ComputeSpace::new(world, space_id, space_size, lanes);
 
 
     write_ok(stream)?;
@@ -466,6 +475,7 @@ fn pocket_open(stream: &mut TcpStream, pocket_state: &Arc<Mutex<PocketState>>) -
 }
 
 
+#[allow(dead_code)]
 fn pocket_write(stream: &mut TcpStream, pocket_state: &Arc<Mutex<PocketState>>) -> Result<(), SiggError> {
     let handle = read_u32(stream)?;
     let x = read_i32(stream)?;
@@ -529,6 +539,7 @@ fn pocket_read_f32(stream: &mut TcpStream, pocket_state: &Arc<Mutex<PocketState>
 
 
 
+#[allow(dead_code)]
 fn atlas_upsert(stream: &mut TcpStream, pocket_state: &Arc<Mutex<PocketState>>) -> Result<(), SiggError> {
     let u = read_u32(stream)?;
     let v = read_u32(stream)?;
@@ -887,9 +898,9 @@ fn pocket_trigger(stream: &mut TcpStream, pocket_state: &Arc<Mutex<PocketState>>
         chunks.push((cx, cy, cz));
     }
 
-    let steps0 = read_u32(stream)?;
-    let diffusion0 = read_f32(stream)?;
-    let threshold0 = read_f32(stream)?;
+    let _steps0 = read_u32(stream)?;
+    let _diffusion0 = read_f32(stream)?;
+    let _threshold0 = read_f32(stream)?;
     let topn = read_u32(stream)? as usize;
 
     // z_dim を先に取得して query_vec 読み
@@ -952,6 +963,7 @@ fn pocket_trigger(stream: &mut TcpStream, pocket_state: &Arc<Mutex<PocketState>>
     Ok(())
 }
 
+#[allow(dead_code)]
 fn hash_query_f32(query: &[f32]) -> u64 {
     // f32 の bits をそのまま畳む（安定・高速）
     let mut acc: u64 = 1469598103934665603u64; // FNV offset
@@ -963,6 +975,7 @@ fn hash_query_f32(query: &[f32]) -> u64 {
 }
 
 
+#[allow(dead_code)]
 fn pocket_persist(
     stream: &mut TcpStream,
     pocket_state: &Arc<Mutex<PocketState>>,
@@ -1015,7 +1028,14 @@ fn handle_client(mut stream: TcpStream, ctx: ServerCtx) -> Result<(), SiggError>
             TAG_AI_SET_IO => { ai_set_io(&mut stream, &ctx.pocket)?; }
             TAG_POCKET_WRITE_F32 => { pocket_write_f32(&mut stream, &ctx.pocket)?; }
             TAG_POCKET_READ_F32 => { pocket_read_f32(&mut stream, &ctx.pocket)?; }
-
+            TAG_AI_GET_ENV_PERIOD => {
+                let pocket = ctx.pocket.lock().unwrap();
+                ai_get_env_period(&mut stream, &*pocket)?;
+            }
+            TAG_AI_SET_ENV_PERIOD => {
+                let pocket = ctx.pocket.lock().unwrap();
+                ai_set_env_period(&mut stream, &*pocket)?;
+            }
 
 
             TAG_RUN_ONCE => {
@@ -1663,15 +1683,39 @@ fn digest_u32(u: &[f32], v: &[f32], w: usize, h: usize) -> u32 {
 }
 pub fn main_server_bin() -> Result<(), SiggError> {
     let args: Vec<String> = std::env::args().collect();
-    let mut addr = "127.0.0.1:39999".to_string();
+    let mut addr = "127.0.0.1:9001".to_string();
+    // Allow runtime tuning of env period without recompiling.
+    // Priority: CLI flag > ENV var > default (ai_runtime default).
+    if let Ok(v) = std::env::var("SIGG_ENV_PERIOD").or_else(|_| std::env::var("ENV_PERIOD")) {
+        if let Ok(n) = v.parse::<u32>() { crate::ai_runtime::set_env_period(n); }
+    }
     let mut i = 1;
     while i < args.len() {
-        if args[i] == "--addr" && i + 1 < args.len() {
+        let a = args[i].as_str();
+
+        if a == "--addr" && i + 1 < args.len() {
             addr = args[i + 1].clone();
             i += 2;
-        } else {
-            i += 1;
+            continue;
         }
+
+        if a == "--env-period" && i + 1 < args.len() {
+            if let Ok(n) = args[i + 1].parse::<u32>() {
+                crate::ai_runtime::set_env_period(n);
+            }
+            i += 2;
+            continue;
+        }
+
+        if let Some(v) = a.strip_prefix("--env-period=") {
+            if let Ok(n) = v.parse::<u32>() {
+                crate::ai_runtime::set_env_period(n);
+            }
+            i += 1;
+            continue;
+        }
+
+        i += 1;
     }
     serve(&addr)
 }
@@ -1692,6 +1736,7 @@ pub fn main_server_bin() -> Result<(), SiggError> {
 //   u32 space_id
 //
 
+#[allow(dead_code)]
 fn guard_io_xyz(mut p: (i32,i32,i32)) -> (i32,i32,i32) {
     if p.0 >= 0 && p.0 < PROG_MAX {
         p.0 = IO_BASE;
@@ -1699,116 +1744,14 @@ fn guard_io_xyz(mut p: (i32,i32,i32)) -> (i32,i32,i32) {
     p
 }
 
+#[allow(dead_code)]
 fn guard_io_pair(io_in: (i32,i32,i32), io_out: (i32,i32,i32)) -> ((i32,i32,i32),(i32,i32,i32)) {
-    let mut a = guard_io_xyz(io_in);
+    let a = guard_io_xyz(io_in);
     let mut b = guard_io_xyz(io_out);
     if a.0 == b.0 { b.0 += 1; }
     if b.0 + 2 >= 0 && b.0 + 2 < PROG_MAX { b.0 = IO_BASE + 1; }
     (a,b)
 }
-// fn ai_create(stream: &mut TcpStream, pocket_state: &Arc<Mutex<PocketState>>) -> Result<(), SiggError> {
-//     let pocket_h = read_u32(stream)?;
-//     let u = read_u32(stream)?;
-//     let v = read_u32(stream)?;
-//     let w = read_u32(stream)?;
-//     let space_size = read_u32(stream)? as usize;
-//     let lanes = read_u32(stream)? as usize;
-
-//     // ★追加：I/O座標
-//     // ★命令領域衝突ガード（最重要）
-//     let orig_in  = (read_i32(stream)?, read_i32(stream)?, read_i32(stream)?);
-//     let orig_out = (read_i32(stream)?, read_i32(stream)?, read_i32(stream)?);
-//     let (io_in, io_out) = guard_io_pair(orig_in, orig_out);
-//     if io_in != orig_in || io_out != orig_out {
-//         eprintln!("[AI] io relocated: in={orig_in:?}->{io_in:?}, out={orig_out:?}->{io_out:?}");
-//     }
-//     // --- 命令領域(0..=63)を避けるため、必要なら +256 ずらす
-//     let guard = 256;
-//     let prog_max = 64;
-
-//     let mut io_in  = io_in;
-//     let mut io_out = io_out;
-
-//     if io_in.0 >= 0 && io_in.0 < prog_max { io_in.0 += guard; }
-//     if io_out.0 >= 0 && io_out.0 < prog_max { io_out.0 += guard; }
-
-//     let pocket_in_addr  = (read_i32(stream)?, read_i32(stream)?, read_i32(stream)?);
-//     let pocket_out_addr = (read_i32(stream)?, read_i32(stream)?, read_i32(stream)?); // ★追加
-//     let pocket_score_addr = (read_i32(stream)?, read_i32(stream)?, read_i32(stream)?);
-//     // ★追加：policy座標
-//     let pocket_policy_addr = (read_i32(stream)?, read_i32(stream)?, read_i32(stream)?);
-
-//     let mut st = pocket_state.lock().unwrap();
-
-//     // pocket存在確認
-//     let p = st.pockets.get(&pocket_h)
-//         .ok_or_else(|| SiggError::runtime("bad pocket handle"))?;
-//     if p.world != (u, v, w) {
-//         return write_err(stream, "world mismatch");
-//     }
-//     // ---- space_id はここで確保（ブロック外）----
-//     let space_id = st.next_space_id;
-//     st.next_space_id += 1;
-
-//     // ComputeSpace 作成
-//     let mut space = ComputeSpace::new_blank(space_size as i32, lanes);
-
-//     // --- CPUプログラムをアセンブルしてロード
-//     let src = r#"
-//     loop:
-//         LOAD  r1, r0, 100      // r1 = in_bits
-//         LOAD  r2, r0, 102      // r2 = policy_bits
-//         MOVI  r3, 1
-//         AND   r2, r2, r3       // r2 = policy_id (0 or 1)
-//         MOVI  r4, 1
-//         ADD   r2, r2, r4       // r2 = policy_id + 1
-//         ADD   r1, r1, r2       // r1 = in_bits + (policy_id+1)
-//         STORE r1, r0, 101      // out_bits
-//         JMP   loop
-//     "#;
-
-//     let prog = asm::assemble(src).map_err(|e| SiggError::runtime(format!("assemble failed: {e}")))?;
-//     load_program_into_space(&mut space, &prog);
-
-//     // insert
-//     st.compute_spaces.insert(space_id, space);
-
-//     // CPU 作成（handle 管理）
-//     let cpu_handle = st.next_handle;
-//     st.next_handle += 1;
-//     st.cpu_states.insert(cpu_handle, CpuState::new((u, v, w)));
-
-//     // Agent 作成（参照のみ）
-//     let agent_id = st.next_agent_id;
-//     st.next_agent_id += 1;
-
-//     st.agents.insert(agent_id, SiggAgent {
-//         id: agent_id,
-//         world: (u, v, w),
-//         pocket_handle: pocket_h,
-//         space_id,
-//         cpu_handle,
-//         sensors_flags: 0,
-//         sensors_coords: vec![],
-//         io_in,
-//         io_out,
-//         pocket_in_addr,
-//         pocket_out_addr,
-//         pocket_score_addr,
-//         pocket_policy_addr,
-//         score_mu_bits: 0.0f32.to_bits(),
-//         score_beta: 0.20,
-//         mode: 0,
-        
-//     });
-    
-
-//     write_ok(stream)?;
-//     write_u64(stream, agent_id)?;
-//     write_u32(stream, space_id)?;
-//     write_u32(stream, cpu_handle)?;
-//     Ok(())
-// }
 
 fn ai_create(stream: &mut TcpStream, pocket_state: &Arc<Mutex<PocketState>>) -> Result<(), SiggError> {
     // 例：クライアントから pocket_handle を受け取る
@@ -1818,7 +1761,7 @@ fn ai_create(stream: &mut TcpStream, pocket_state: &Arc<Mutex<PocketState>>) -> 
         .lock()
         .map_err(|_| SiggError::runtime("pocket_state poisoned"))?;
 
-    let id = crate::ai_runtime::ai_create_core(
+    let _id = crate::ai_runtime::ai_create_core(
         &mut st,
         (0, 0, 0),
         pocket_handle,
@@ -1830,12 +1773,9 @@ fn ai_create(stream: &mut TcpStream, pocket_state: &Arc<Mutex<PocketState>>) -> 
     )?;
 
     // 返信：agent_id(u64)
-    write_u64(stream, id)?;
+    //write_u64(stream, id)?;
     Ok(())
 }
-
-
-
 // AI_TICK:
 //   u64 agent_id
 //   u32 budget (cpu steps)
@@ -1854,19 +1794,20 @@ fn ai_tick(stream: &mut TcpStream, pocket_state: &Arc<Mutex<PocketState>>) -> Re
         .lock()
         .map_err(|_| SiggError::runtime("pocket_state poisoned"))?;
 
-    let r = crate::ai_runtime::ai_tick_core(&mut st, agent_id, budget)?;
+    let _r = crate::ai_runtime::ai_tick_core(&mut st, agent_id, budget)?;
 
-    println!("mu=\n{}\nmode=\n{}", r.mu, r.mode);
+    // println!("mu=\n{}\nmode=\n{}", r.mu, r.mode);
 
     // 返信（必要なものだけ送る：例として tick, ok, mu, mode）
-    write_u32(stream, r.tick)?;
-    write_u32(stream, if r.ok { 1 } else { 0 })?;
-    write_u32(stream, r.mu.to_bits())?;
-    write_u32(stream, r.mode)?;
+    // write_u32(stream, r.tick)?;
+    // write_u32(stream, if r.ok { 1 } else { 0 })?;
+    // write_u32(stream, r.mu.to_bits())?;
+    // write_u32(stream, r.mode)?;
     Ok(())
 }
 
 
+#[allow(dead_code)]
 fn load_program_into_space(space: &mut ComputeSpace, prog: &[u32]) {
     // 命令は (x=0.., y=0, z=0, lane=0) に置く（cpu_step_memの設計通り）
     for (i, &inst) in prog.iter().enumerate() {
@@ -1971,6 +1912,19 @@ fn ai_set_io(stream: &mut TcpStream, pocket_state: &Arc<Mutex<PocketState>>) -> 
     ag.pocket_score_addr = (ses_x,ses_y,ses_z);
 
     write_ok(stream)?;
+    Ok(())
+}
+fn ai_get_env_period(stream: &mut TcpStream, _pocket: &PocketState) -> Result<(), SiggError> {
+    write_ok(stream)?;
+    write_u32(stream, ai_runtime::get_env_period())?;
+    Ok(())
+}
+
+fn ai_set_env_period(stream: &mut TcpStream, _pocket: &PocketState) -> Result<(), SiggError> {
+    let p = read_u32(stream)?;
+    ai_runtime::set_env_period(p);
+    write_ok(stream)?;
+    write_u32(stream, ai_runtime::get_env_period())?;
     Ok(())
 }
 
