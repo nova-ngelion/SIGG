@@ -65,7 +65,6 @@ impl<'a> Lexer<'a> {
             "enum" => Tok::Enum,
             "macro" => Tok::Macro,
             "as" => Tok::As,
-            "fn" => Tok::Fn,
             "event" => Tok::Event,
             "when" => Tok::When,
             _ => Tok::Ident(s.to_string()),

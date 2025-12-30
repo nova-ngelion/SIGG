@@ -321,7 +321,7 @@ impl<'a> FnCompiler<'a> {
                 }
 
                 // どれも当たらなかった場合（ここに落ちる）
-                let else_start = self.chunk.ops.len();
+                let _else_start = self.chunk.ops.len();
                 if let Some(else_stmts) = else_branch {
                     self.chunk.emit(Op::PushScope);
                     for st in else_stmts { self.compile_stmt(st)?; }

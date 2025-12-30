@@ -1,10 +1,8 @@
-use std::sync::Arc;
 use std::time::Instant;
 use std::collections::HashMap;
 use crate::bytecode::FnId;
-use std::rc::Rc;
-use std::cell::RefCell;
-use crate::pocket::tensor::Tensor; // 前回のTensorモジュールをインポート
+use std::sync::{Arc, RwLock};
+use crate::pocket::tensor::Tensor;
 
 #[derive(Clone, Copy, Debug)]
 pub enum Boundary {
@@ -95,7 +93,7 @@ pub enum Value {
     Map(HashMap<String, Value>),
     Lambda(FnId),
     List(Vec<Value>),
-    Tensor(Rc<RefCell<Tensor>>),
+    Tensor(Arc<RwLock<Tensor>>),
     Closure {
         fn_id: FnId,
         upvalues: Vec<Value>,
@@ -147,6 +145,24 @@ pub enum Value {
         right: Box<Value>,
     },
 }
+
+// PartialEqの手動実装 (浮動小数点やTensorが含まれるため厳密な比較は難しいが、簡易的に実装)
+impl PartialEq for Value {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Value::Bool(a), Value::Bool(b)) => a == b,
+            (Value::Int(a), Value::Int(b)) => a == b,
+            (Value::Float(a), Value::Float(b)) => a == b,
+            (Value::Str(a), Value::Str(b)) => a == b,
+            (Value::List(a), Value::List(b)) => a == b,
+            // Tensor同士の比較はポインタの一致、または中身の比較が必要
+            // ここでは簡易的に「同じArcを指しているか」で判定するか、常にfalseにする
+            (Value::Tensor(a), Value::Tensor(b)) => Arc::ptr_eq(a, b),
+            _ => false,
+        }
+    }
+}
+
 // ★ 手動で Debug を実装
 impl std::fmt::Debug for Value {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -242,10 +258,13 @@ impl std::fmt::Debug for Value {
                 }
                 write!(f, "]")
             },
-            // ★ Tensorの表示 (これを追加しないとエラーになります)
             Value::Tensor(t) => {
-                let t = t.borrow();
-                write!(f, "<Tensor shape={:?}>", t.shape)
+                // RwLockの読み取りロックを取得
+                if let Ok(guard) = t.read() {
+                    write!(f, "<Tensor shape={:?}>", guard.shape)
+                } else {
+                    write!(f, "<Tensor (locked)>")
+                }
             },
         }
     }
@@ -339,8 +358,12 @@ impl std::fmt::Display for Value {
                 write!(f, "({} {} {})", left, op_str, right)
             }
             Value::Tensor(t) => {
-                let t = t.borrow();
-                write!(f, "<Tensor shape={:?}>", t.shape)
+                // RwLockの読み取りロックを取得
+                if let Ok(guard) = t.read() {
+                    write!(f, "<Tensor shape={:?}>", guard.shape)
+                } else {
+                    write!(f, "<Tensor (locked)>")
+                }
             },
             _ => write!(f, "<Value>"),
         }

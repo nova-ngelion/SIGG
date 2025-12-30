@@ -346,7 +346,7 @@ impl TypeChecker {
                     _ => Ok(Type::Unknown),
                 }
             }
-            Expr::Lambda { params, body } => {
+            Expr::Lambda { params, body: _ } => {
                 let param_types: Vec<Type> = params.iter()
                     .map(|(_, ty_ann)| {
                         ty_ann.as_ref()

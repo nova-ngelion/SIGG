@@ -400,7 +400,7 @@ impl VM {
                                 scope_stack: vec![HashMap::new()],
                             });
                         }
-                        Value::Closure { fn_id, upvalues } => {
+                        Value::Closure { fn_id: _, upvalues } => {
                             // クロージャの処理
                             let mut extended_args = upvalues;
                             extended_args.extend(args);

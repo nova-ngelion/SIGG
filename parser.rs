@@ -176,8 +176,6 @@ impl<'a> Parser<'a> {
             Some(Tok::Struct) => self.parse_struct_def(),
             Some(Tok::Enum) => self.parse_enum_def(),
             Some(Tok::Macro) => self.parse_macro_def(),
-            Some(Tok::Event) => self.parse_event_stmt(),
-            Some(Tok::When)  => self.parse_when_stmt(),
             Some(Tok::LBrace) => self.parse_block_stmt(),
             Some(Tok::Event) => self.parse_event_stmt(),
             Some(Tok::When)  => self.parse_when_stmt(),

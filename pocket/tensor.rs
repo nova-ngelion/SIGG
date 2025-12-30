@@ -1,7 +1,6 @@
 // src/pocket/tensor.rs
 
 use std::ops::{Add, Sub, Mul};
-use std::fmt;
 
 /// SIGG理論における「内部セル空間」の次元や、場の値を保持する多次元テンソル
 /// 論文の $\Psi(n, x)$ のうち、内部セル部分 $l^2(\mathbb{Z}^d)$ を表現します。

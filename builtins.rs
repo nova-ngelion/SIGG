@@ -1,4 +1,3 @@
-use std::sync::Arc;
 use rayon::prelude::*;
 use std::sync::{Mutex, OnceLock};
 use crate::error::SiggError;
@@ -13,8 +12,7 @@ use crate::pocket::compute::ComputeSpace;
 use crate::ai_runtime;
 use std::collections::HashMap;
 use std::time::Instant;
-use std::rc::Rc;
-use std::cell::RefCell;
+use std::sync::{Arc, RwLock};
 use crate::pocket::tensor::{Tensor, Complex};
 
 #[allow(dead_code)]
@@ -24,6 +22,7 @@ const IO_BASE:  i32 = 100;  // io_in/io_out はここ以降へ
 
 
 type EvalResult = Result<Value, SiggError>;
+
 fn runtime_err(msg: &str) -> SiggError {
     SiggError::runtime(msg)
 }
@@ -2255,7 +2254,8 @@ pub fn builtin_tensor_new(args: Vec<Value>) -> EvalResult {
     }
 
     let t = Tensor::zeros(shape);
-    Ok(Value::Tensor(Rc::new(RefCell::new(t))))
+    // ★ Arc::new(RwLock::new(...)) に変更
+    Ok(Value::Tensor(Arc::new(RwLock::new(t))))
 }
 
 pub fn builtin_tensor_laplacian(args: Vec<Value>) -> EvalResult {
@@ -2265,9 +2265,12 @@ pub fn builtin_tensor_laplacian(args: Vec<Value>) -> EvalResult {
 
     match &args[0] {
         Value::Tensor(t_rc) => {
-            let t = t_rc.borrow();
-            let result_tensor = t.discrete_laplacian();
-            Ok(Value::Tensor(Rc::new(RefCell::new(result_tensor))))
+            // ★ .borrow() を .read().map_err(...) に変更
+            let t_lock = t_rc.read().map_err(|_| runtime_err("Failed to acquire read lock on tensor"))?;
+            let result_tensor = t_lock.discrete_laplacian();
+            
+            // 新しいTensorを返す
+            Ok(Value::Tensor(Arc::new(RwLock::new(result_tensor))))
         },
         _ => Err(runtime_err("Argument must be a Tensor")),
     }
@@ -2293,7 +2296,9 @@ pub fn builtin_tensor_get(args: Vec<Value>) -> EvalResult {
         _ => return Err(runtime_err("Second argument must be a coordinate list")),
     };
 
-    let val = t_rc.borrow().get(&coords);
+    // ★ .borrow() を .read() に変更
+    let t_lock = t_rc.read().map_err(|_| runtime_err("Failed to acquire read lock"))?;
+    let val = t_lock.get(&coords);
 
     Ok(Value::List(vec![
         Value::Float(val.re),
@@ -2321,10 +2326,8 @@ pub fn builtin_tensor_set(args: Vec<Value>) -> EvalResult {
         _ => return Err(runtime_err("Second argument must be a coordinate list")),
     };
 
-    // 複雑なマッチングを修正
     let complex_val = match &args[2] {
         Value::List(v) if v.len() == 2 => {
-            // &Value から値を取り出す際の参照解決を修正
             let re = match &v[0] { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => 0.0 };
             let im = match &v[1] { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => 0.0 };
             Complex::new(re, im)
@@ -2334,12 +2337,17 @@ pub fn builtin_tensor_set(args: Vec<Value>) -> EvalResult {
         _ => return Err(runtime_err("Third argument must be [re, im] or a number")),
     };
 
-    t_rc.borrow_mut().set(&coords, complex_val);
+    // ★ .borrow_mut() を .write() に変更
+    let mut t_lock = t_rc.write().map_err(|_| runtime_err("Failed to acquire write lock"))?;
+    t_lock.set(&coords, complex_val);
 
-    // Void相当として空リストを返す
     Ok(Value::List(vec![])) 
 }
 
+pub fn builtin_list(args: Vec<Value>) -> EvalResult {
+    // 引数をそのままListとして返すだけ
+    Ok(Value::List(args))
+}
 
 fn builtin_grid_stats(args: Vec<Value>) -> Result<Value, SiggError> {
     need_n(&args, 1, "grid_stats")?;
@@ -2356,6 +2364,7 @@ fn builtin_grid_stats(args: Vec<Value>) -> Result<Value, SiggError> {
     ]))
 }
 pub fn builtins() -> Vec<Builtin> {
+    println!("DEBUG: Loading builtins..."); // ★ これを追加
     vec![
         Builtin { name: "print", f: builtin_print },
         Builtin { name: "vec_get", f: builtin_vec_get },
@@ -2445,6 +2454,7 @@ pub fn builtins() -> Vec<Builtin> {
         Builtin { name: "laplacian", f: builtin_tensor_laplacian },
         Builtin { name: "t_get", f: builtin_tensor_get },
         Builtin { name: "t_set", f: builtin_tensor_set },
+        Builtin { name: "list", f: builtin_list },
         //Builtin { name: "", f: },
     ]
 }
