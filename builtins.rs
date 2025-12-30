@@ -13,6 +13,9 @@ use crate::pocket::compute::ComputeSpace;
 use crate::ai_runtime;
 use std::collections::HashMap;
 use std::time::Instant;
+use std::rc::Rc;
+use std::cell::RefCell;
+use crate::pocket::tensor::{Tensor, Complex};
 
 #[allow(dead_code)]
 const PROG_MAX: i32 = 64;   // 命令領域は 0..63
@@ -20,7 +23,10 @@ const PROG_MAX: i32 = 64;   // 命令領域は 0..63
 const IO_BASE:  i32 = 100;  // io_in/io_out はここ以降へ
 
 
-
+type EvalResult = Result<Value, SiggError>;
+fn runtime_err(msg: &str) -> SiggError {
+    SiggError::runtime(msg)
+}
 
 pub struct Builtin {
     pub name: &'static str,
@@ -2221,6 +2227,120 @@ fn as_float_vec(v: &Value) -> Result<Vec<f32>, SiggError> {
 }
 
 
+
+pub fn builtin_tensor_new(args: Vec<Value>) -> EvalResult {
+    if args.len() != 1 {
+        return Err(runtime_err("tensor() takes exactly 1 argument (shape)"));
+    }
+
+    let shape: Vec<usize> = match &args[0] {
+        Value::List(list) => {
+            let mut dims = Vec::new();
+            for v in list {
+                match v {
+                    Value::Int(n) => {
+                        if *n < 0 { return Err(runtime_err("Shape dimensions must be positive")); }
+                        dims.push(*n as usize);
+                    },
+                    _ => return Err(runtime_err("Shape must be a list of integers")),
+                }
+            }
+            dims
+        },
+        _ => return Err(runtime_err("Argument must be a list representing shape")),
+    };
+
+    if shape.is_empty() {
+        return Err(runtime_err("Shape cannot be empty"));
+    }
+
+    let t = Tensor::zeros(shape);
+    Ok(Value::Tensor(Rc::new(RefCell::new(t))))
+}
+
+pub fn builtin_tensor_laplacian(args: Vec<Value>) -> EvalResult {
+    if args.len() != 1 {
+        return Err(runtime_err("laplacian() takes exactly 1 argument"));
+    }
+
+    match &args[0] {
+        Value::Tensor(t_rc) => {
+            let t = t_rc.borrow();
+            let result_tensor = t.discrete_laplacian();
+            Ok(Value::Tensor(Rc::new(RefCell::new(result_tensor))))
+        },
+        _ => Err(runtime_err("Argument must be a Tensor")),
+    }
+}
+
+pub fn builtin_tensor_get(args: Vec<Value>) -> EvalResult {
+    if args.len() != 2 {
+        return Err(runtime_err("t_get() takes 2 arguments: (tensor, coords)"));
+    }
+
+    let t_rc = match &args[0] {
+        Value::Tensor(t) => t,
+        _ => return Err(runtime_err("First argument must be a Tensor")),
+    };
+
+    let coords: Vec<usize> = match &args[1] {
+        Value::List(list) => {
+            list.iter().map(|v| match v {
+                Value::Int(n) => *n as usize,
+                _ => 0, 
+            }).collect()
+        },
+        _ => return Err(runtime_err("Second argument must be a coordinate list")),
+    };
+
+    let val = t_rc.borrow().get(&coords);
+
+    Ok(Value::List(vec![
+        Value::Float(val.re),
+        Value::Float(val.im)
+    ]))
+}
+
+pub fn builtin_tensor_set(args: Vec<Value>) -> EvalResult {
+    if args.len() != 3 {
+        return Err(runtime_err("t_set() takes 3 arguments: (tensor, coords, [re, im])"));
+    }
+
+    let t_rc = match &args[0] {
+        Value::Tensor(t) => t,
+        _ => return Err(runtime_err("First argument must be a Tensor")),
+    };
+
+    let coords: Vec<usize> = match &args[1] {
+        Value::List(list) => {
+            list.iter().map(|v| match v {
+                Value::Int(n) => *n as usize,
+                _ => 0, 
+            }).collect()
+        },
+        _ => return Err(runtime_err("Second argument must be a coordinate list")),
+    };
+
+    // 複雑なマッチングを修正
+    let complex_val = match &args[2] {
+        Value::List(v) if v.len() == 2 => {
+            // &Value から値を取り出す際の参照解決を修正
+            let re = match &v[0] { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => 0.0 };
+            let im = match &v[1] { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => 0.0 };
+            Complex::new(re, im)
+        },
+        Value::Float(f) => Complex::new(*f, 0.0),
+        Value::Int(i) => Complex::new(*i as f64, 0.0),
+        _ => return Err(runtime_err("Third argument must be [re, im] or a number")),
+    };
+
+    t_rc.borrow_mut().set(&coords, complex_val);
+
+    // Void相当として空リストを返す
+    Ok(Value::List(vec![])) 
+}
+
+
 fn builtin_grid_stats(args: Vec<Value>) -> Result<Value, SiggError> {
     need_n(&args, 1, "grid_stats")?;
     let g = as_grid(&args[0])?;
@@ -2321,5 +2441,10 @@ pub fn builtins() -> Vec<Builtin> {
         Builtin { name: "str_to_upper", f: builtin_str_to_upper },
         Builtin { name: "str_to_lower", f: builtin_str_to_lower },
         Builtin { name: "str_len", f: builtin_str_len },
+        Builtin { name: "tensor", f: builtin_tensor_new },
+        Builtin { name: "laplacian", f: builtin_tensor_laplacian },
+        Builtin { name: "t_get", f: builtin_tensor_get },
+        Builtin { name: "t_set", f: builtin_tensor_set },
+        //Builtin { name: "", f: },
     ]
 }

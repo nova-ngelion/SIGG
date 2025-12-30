@@ -2,6 +2,9 @@ use std::sync::Arc;
 use std::time::Instant;
 use std::collections::HashMap;
 use crate::bytecode::FnId;
+use std::rc::Rc;
+use std::cell::RefCell;
+use crate::pocket::tensor::Tensor; // 前回のTensorモジュールをインポート
 
 #[derive(Clone, Copy, Debug)]
 pub enum Boundary {
@@ -90,8 +93,9 @@ pub enum Value {
     Unit,
     Bin(Vec<u8>),
     Map(HashMap<String, Value>),
-    
     Lambda(FnId),
+    List(Vec<Value>),
+    Tensor(Rc<RefCell<Tensor>>),
     Closure {
         fn_id: FnId,
         upvalues: Vec<Value>,
@@ -101,19 +105,16 @@ pub enum Value {
         name: String,
         params: Vec<String>,
     },
-    
     // ★ HostFunction の func フィールドが Debug を実装していない
     HostFunction {
         name: String,
         func: HostFn,
     },
-    
     Macro {
         name: String,
         params: Vec<String>,
         body: Box<crate::ast::Expr>,
     },
-    
     Struct {
         namespace: Option<String>,
         name: String,
@@ -124,20 +125,17 @@ pub enum Value {
         enum_name: String,
         variant_name: String,
         data: Option<Box<Value>>,
-    },
-    
+    },  
     Snapshot {
         timestamp: Instant,
         seed: u64,
         values: Vec<Value>,
         metadata: HashMap<String, String>,
-    },
-    
+    }, 
     Namespace {
         name: String,
         members: HashMap<String, Value>,
     },
-    
     If {
         cond: Box<Value>,
         then_branch: Box<Value>,
@@ -235,6 +233,20 @@ impl std::fmt::Debug for Value {
                     .field("right", right)
                     .finish()
             }
+            // ★ Listの表示
+            Value::List(list) => {
+                write!(f, "[")?;
+                for (i, v) in list.iter().enumerate() {
+                    if i > 0 { write!(f, ", ")?; }
+                    write!(f, "{}", v)?;
+                }
+                write!(f, "]")
+            },
+            // ★ Tensorの表示 (これを追加しないとエラーになります)
+            Value::Tensor(t) => {
+                let t = t.borrow();
+                write!(f, "<Tensor shape={:?}>", t.shape)
+            },
         }
     }
 }
@@ -326,6 +338,11 @@ impl std::fmt::Display for Value {
                 };
                 write!(f, "({} {} {})", left, op_str, right)
             }
+            Value::Tensor(t) => {
+                let t = t.borrow();
+                write!(f, "<Tensor shape={:?}>", t.shape)
+            },
+            _ => write!(f, "<Value>"),
         }
     }
 }
