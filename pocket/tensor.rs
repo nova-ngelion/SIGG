@@ -1,16 +1,10 @@
-// src/pocket/tensor.rs
+use std::fmt;
+use std::ops::{Add, Mul, Sub, Div};
+use std::sync::{Arc, RwLock};
 
-use std::ops::{Add, Sub, Mul};
-
-/// SIGG理論における「内部セル空間」の次元や、場の値を保持する多次元テンソル
-/// 論文の $\Psi(n, x)$ のうち、内部セル部分 $l^2(\mathbb{Z}^d)$ を表現します。
-#[derive(Clone, Debug, PartialEq)]
-pub struct Tensor {
-    pub shape: Vec<usize>,
-    pub data: Vec<Complex>, // 基本は複素数体として扱います
-}
-
-/// 簡易的な複素数構造体（num_complexクレートを使わない場合）
+// ==========================================
+// 複素数構造体 (変更なし)
+// ==========================================
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Complex {
     pub re: f64,
@@ -27,122 +21,594 @@ impl Complex {
     }
 }
 
-// 複素数の演算実装 (簡略化)
 impl Add for Complex {
     type Output = Self;
     fn add(self, other: Self) -> Self {
-        Self::new(self.re + other.re, self.im + other.im)
+        Self { re: self.re + other.re, im: self.im + other.im }
     }
 }
+
 impl Sub for Complex {
     type Output = Self;
     fn sub(self, other: Self) -> Self {
-        Self::new(self.re - other.re, self.im - other.im)
+        Self { re: self.re - other.re, im: self.im - other.im }
     }
 }
-impl Mul<f64> for Complex {
+
+impl Mul for Complex {
     type Output = Self;
-    fn mul(self, rhs: f64) -> Self {
-        Self::new(self.re * rhs, self.im * rhs)
+    fn mul(self, other: Self) -> Self {
+        Self {
+            re: self.re * other.re - self.im * other.im,
+            im: self.re * other.im + self.im * other.re,
+        }
     }
+}
+
+impl Div for Complex {
+    type Output = Self;
+    fn div(self, other: Self) -> Self {
+        let denom = other.re * other.re + other.im * other.im;
+        if denom == 0.0 {
+            // ゼロ除算回避 (簡易)
+            return Complex::new(0.0, 0.0);
+        }
+        Self {
+            re: (self.re * other.re + self.im * other.im) / denom,
+            im: (self.im * other.re - self.re * other.im) / denom,
+        }
+    }
+}
+
+impl fmt::Display for Complex {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{:.2}+{:.2}i", self.re, self.im)
+    }
+}
+
+// ==========================================
+// Autograd用 定義
+// ==========================================
+
+#[derive(Clone, Debug)]
+pub enum OpType {
+    Leaf,
+    Add,
+    Sub,
+    Mul,
+    Div, // 割り算
+    Rem, // 剰余
+    Neg, // 単項マイナス
+    Exp,
+    Laplacian,
+}
+
+pub struct Tensor {
+    pub data: Vec<Complex>,
+    pub shape: Vec<usize>,
+    pub grad: Option<Vec<Complex>>,
+    
+    pub requires_grad: bool,
+    pub op: OpType,
+    pub parents: Vec<Arc<RwLock<Tensor>>>,
 }
 
 impl Tensor {
-    /// ゼロ初期化されたテンソルを作成
     pub fn zeros(shape: Vec<usize>) -> Self {
         let size = shape.iter().product();
         Tensor {
-            shape,
             data: vec![Complex::new(0.0, 0.0); size],
+            shape,
+            grad: None,
+            requires_grad: false,
+            op: OpType::Leaf,
+            parents: Vec::new(),
         }
     }
 
-    /// フラットなインデックスを計算
-    fn get_index(&self, coords: &[usize]) -> Option<usize> {
-        if coords.len() != self.shape.len() {
-            return None;
-        }
-        let mut index = 0;
-        let mut stride = 1;
-        for (i, &dim_size) in self.shape.iter().rev().enumerate() {
-            let coord = coords[self.shape.len() - 1 - i];
-            if coord >= dim_size {
-                return None; // 境界外
-            }
-            index += coord * stride;
-            stride *= dim_size;
-        }
-        Some(index)
-    }
-
-    /// 座標から値を取得
-    pub fn get(&self, coords: &[usize]) -> Complex {
-        if let Some(idx) = self.get_index(coords) {
-            self.data[idx]
-        } else {
-            Complex::new(0.0, 0.0) // 境界外は0とみなす（ディリクレ境界条件的な扱い）
-        }
-    }
-
-    /// 座標に値を設定
-    pub fn set(&mut self, coords: &[usize], value: Complex) {
-        if let Some(idx) = self.get_index(coords) {
+    pub fn set(&mut self, indices: &[usize], value: Complex) {
+        let idx = self.get_index(indices);
+        if idx < self.data.len() {
             self.data[idx] = value;
         }
     }
 
-    /// SIGG理論: 定義 2.3 離散セル・ラプラシアンの実装
-    /// (Delta_cell psi)(n) = sum_{j=1}^{d} [psi(n + e_j) + psi(n - e_j) - 2psi(n)]
-    /// 
-    pub fn discrete_laplacian(&self) -> Tensor {
-        let mut result = Tensor::zeros(self.shape.clone());
-        let d = self.shape.len(); // 内部次元 d
+    pub fn get(&self, indices: &[usize]) -> Complex {
+        let idx = self.get_index(indices);
+        if idx < self.data.len() {
+            self.data[idx]
+        } else {
+            Complex::new(0.0, 0.0)
+        }
+    }
 
-        // 全要素に対してラプラシアンを計算
-        // (注: 本来は再帰やイテレータでN次元ループを行いますが、ここでは簡略化のため概念を示します)
-        // 実装時は `ndarray` クレートのようなイテレータを使用するか、
-        // フラットなインデックスから座標を復元して計算します。
-        
+    fn get_index(&self, indices: &[usize]) -> usize {
+        let mut idx = 0;
+        let mut stride = 1;
+        for (i, &dim_idx) in indices.iter().rev().zip(self.shape.iter().rev()) {
+            idx += i * stride;
+            stride *= dim_idx;
+        }
+        idx
+    }
+
+    // ラプラシアンフィルタ (以前追加したもの)
+    pub fn discrete_laplacian(&self) -> Self {
+        let mut out = Tensor::zeros(self.shape.clone());
+        let ndim = self.shape.len();
+
         for i in 0..self.data.len() {
-            let coords = self.index_to_coords(i);
-            let center_val = self.data[i];
-            let mut sum_neighbors = Complex::new(0.0, 0.0);
+            let mut coords = vec![0; ndim];
+            let mut temp_i = i;
+            for d in (0..ndim).rev() {
+                coords[d] = temp_i % self.shape[d];
+                temp_i /= self.shape[d];
+            }
 
-            for axis in 0..d {
-                // n + e_j (正方向の隣人)
-                let mut neighbor_coords_pos = coords.clone();
-                if neighbor_coords_pos[axis] + 1 < self.shape[axis] {
-                    neighbor_coords_pos[axis] += 1;
-                    sum_neighbors = sum_neighbors + self.get(&neighbor_coords_pos);
+            let center = self.data[i];
+            let mut sum_neighbors = Complex::new(0.0, 0.0);
+            let mut neighbor_count = 0;
+
+            for d in 0..ndim {
+                if coords[d] + 1 < self.shape[d] {
+                    let mut neighbor_coords = coords.clone();
+                    neighbor_coords[d] += 1;
+                    let idx = self.get_index(&neighbor_coords);
+                    sum_neighbors = sum_neighbors + self.data[idx];
+                    neighbor_count += 1;
                 }
-                
-                // n - e_j (負方向の隣人)
-                let mut neighbor_coords_neg = coords.clone();
-                if neighbor_coords_neg[axis] > 0 {
-                    neighbor_coords_neg[axis] -= 1;
-                    sum_neighbors = sum_neighbors + self.get(&neighbor_coords_neg);
+                if coords[d] > 0 {
+                    let mut neighbor_coords = coords.clone();
+                    neighbor_coords[d] -= 1;
+                    let idx = self.get_index(&neighbor_coords);
+                    sum_neighbors = sum_neighbors + self.data[idx];
+                    neighbor_count += 1;
                 }
             }
 
-            // ラプラシアンの計算: 近傍の和 - 2*次元数 * 自分
-            // 定義式: psi(n+e) + psi(n-e) - 2psi(n) の総和
-            // これは (近傍の総和) - (2 * d * psi(n)) と同値です。
-            let laplacian_val = sum_neighbors - (center_val * (2.0 * d as f64));
-            
-            result.data[i] = laplacian_val;
+            let val = sum_neighbors - center * Complex::new(neighbor_count as f64, 0.0);
+            out.data[i] = val;
         }
-
-        result
+        out
     }
 
-    /// インデックスから座標への変換ヘルパー
-    fn index_to_coords(&self, index: usize) -> Vec<usize> {
-        let mut coords = vec![0; self.shape.len()];
-        let mut current_idx = index;
-        for (i, &dim_size) in self.shape.iter().rev().enumerate() {
-            coords[self.shape.len() - 1 - i] = current_idx % dim_size;
-            current_idx /= dim_size;
+    // --- Autograd Graph Operations ---
+
+    pub fn add_graph(lhs: Arc<RwLock<Tensor>>, rhs: Arc<RwLock<Tensor>>) -> Arc<RwLock<Tensor>> {
+        let (lhs_data, lhs_shape, lhs_req) = {
+            let r = lhs.read().unwrap();
+            (r.data.clone(), r.shape.clone(), r.requires_grad)
+        };
+        let (rhs_data, rhs_shape, rhs_req) = {
+            let r = rhs.read().unwrap();
+            (r.data.clone(), r.shape.clone(), r.requires_grad)
+        };
+
+        if lhs_shape != rhs_shape {
+            panic!("Shape mismatch in add: {:?} vs {:?}", lhs_shape, rhs_shape);
         }
-        coords
+
+        let new_data: Vec<Complex> = lhs_data.iter().zip(rhs_data.iter())
+            .map(|(a, b)| *a + *b)
+            .collect();
+
+        Arc::new(RwLock::new(Tensor {
+            data: new_data,
+            shape: lhs_shape,
+            grad: None,
+            requires_grad: lhs_req || rhs_req,
+            op: OpType::Add,
+            parents: vec![lhs, rhs],
+        }))
+    }
+
+    pub fn sub_graph(lhs: Arc<RwLock<Tensor>>, rhs: Arc<RwLock<Tensor>>) -> Arc<RwLock<Tensor>> {
+        let (lhs_data, lhs_shape, lhs_req) = {
+            let r = lhs.read().unwrap();
+            (r.data.clone(), r.shape.clone(), r.requires_grad)
+        };
+        let (rhs_data, rhs_shape, rhs_req) = {
+            let r = rhs.read().unwrap();
+            (r.data.clone(), r.shape.clone(), r.requires_grad)
+        };
+
+        if lhs_shape != rhs_shape {
+            panic!("Shape mismatch in sub: {:?} vs {:?}", lhs_shape, rhs_shape);
+        }
+
+        let new_data: Vec<Complex> = lhs_data.iter().zip(rhs_data.iter())
+            .map(|(a, b)| *a - *b)
+            .collect();
+
+        Arc::new(RwLock::new(Tensor {
+            data: new_data,
+            shape: lhs_shape,
+            grad: None,
+            requires_grad: lhs_req || rhs_req,
+            op: OpType::Sub,
+            parents: vec![lhs, rhs],
+        }))
+    }
+
+    pub fn mul_graph(lhs: Arc<RwLock<Tensor>>, rhs: Arc<RwLock<Tensor>>) -> Arc<RwLock<Tensor>> {
+        let (lhs_data, lhs_shape, lhs_req) = {
+            let r = lhs.read().unwrap();
+            (r.data.clone(), r.shape.clone(), r.requires_grad)
+        };
+        let (rhs_data, rhs_shape, rhs_req) = {
+            let r = rhs.read().unwrap();
+            (r.data.clone(), r.shape.clone(), r.requires_grad)
+        };
+
+        // ★改良: スカラ放送 (Broadcasting) 対応
+        let (new_data, new_shape) = if lhs_shape == rhs_shape {
+            // サイズが同じ場合 (これまで通り)
+            let data = lhs_data.iter().zip(rhs_data.iter()).map(|(a, b)| *a * *b).collect();
+            (data, lhs_shape)
+        } else if lhs_shape.len() == 1 && lhs_shape[0] == 1 {
+            // 左がスカラ [1]、右がベクトル [N]
+            let s = lhs_data[0];
+            let data = rhs_data.iter().map(|b| s * *b).collect();
+            (data, rhs_shape)
+        } else if rhs_shape.len() == 1 && rhs_shape[0] == 1 {
+            // 左がベクトル [N]、右がスカラ [1]
+            let s = rhs_data[0];
+            let data = lhs_data.iter().map(|a| *a * s).collect();
+            (data, lhs_shape)
+        } else {
+            panic!("Shape mismatch in mul: {:?} vs {:?}", lhs_shape, rhs_shape);
+        };
+
+        Arc::new(RwLock::new(Tensor {
+            data: new_data,
+            shape: new_shape,
+            grad: None,
+            requires_grad: lhs_req || rhs_req,
+            op: OpType::Mul,
+            parents: vec![lhs, rhs],
+        }))
+    }
+
+    pub fn div_graph(lhs: Arc<RwLock<Tensor>>, rhs: Arc<RwLock<Tensor>>) -> Arc<RwLock<Tensor>> {
+        let (lhs_data, lhs_shape, lhs_req) = {
+            let r = lhs.read().unwrap();
+            (r.data.clone(), r.shape.clone(), r.requires_grad)
+        };
+        let (rhs_data, rhs_shape, rhs_req) = {
+            let r = rhs.read().unwrap();
+            (r.data.clone(), r.shape.clone(), r.requires_grad)
+        };
+
+        if lhs_shape != rhs_shape {
+            panic!("Shape mismatch in div: {:?} vs {:?}", lhs_shape, rhs_shape);
+        }
+
+        let new_data: Vec<Complex> = lhs_data.iter().zip(rhs_data.iter())
+            .map(|(a, b)| *a / *b)
+            .collect();
+
+        Arc::new(RwLock::new(Tensor {
+            data: new_data,
+            shape: lhs_shape,
+            grad: None,
+            requires_grad: lhs_req || rhs_req,
+            op: OpType::Div,
+            parents: vec![lhs, rhs],
+        }))
+    }
+
+    pub fn rem_graph(lhs: Arc<RwLock<Tensor>>, rhs: Arc<RwLock<Tensor>>) -> Arc<RwLock<Tensor>> {
+        let (lhs_data, lhs_shape, _) = {
+            let r = lhs.read().unwrap();
+            (r.data.clone(), r.shape.clone(), r.requires_grad)
+        };
+        let (rhs_data, rhs_shape, _) = {
+            let r = rhs.read().unwrap();
+            (r.data.clone(), r.shape.clone(), r.requires_grad)
+        };
+
+        if lhs_shape != rhs_shape {
+            panic!("Shape mismatch in rem: {:?} vs {:?}", lhs_shape, rhs_shape);
+        }
+
+        let new_data: Vec<Complex> = lhs_data.iter().zip(rhs_data.iter())
+            .map(|(a, b)| {
+                // 実部のみ剰余をとる簡易実装
+                if b.re == 0.0 { Complex::new(0.0, 0.0) } 
+                else { Complex::new(a.re % b.re, 0.0) }
+            })
+            .collect();
+
+        Arc::new(RwLock::new(Tensor {
+            data: new_data,
+            shape: lhs_shape,
+            grad: None,
+            requires_grad: false, // 勾配計算なし
+            op: OpType::Rem,
+            parents: Vec::new(),
+        }))
+    }
+
+    pub fn neg_graph(arg: Arc<RwLock<Tensor>>) -> Arc<RwLock<Tensor>> {
+        let (data, shape, req) = {
+            let r = arg.read().unwrap();
+            (r.data.clone(), r.shape.clone(), r.requires_grad)
+        };
+        let new_data: Vec<Complex> = data.iter().map(|a| Complex::new(-a.re, -a.im)).collect();
+        
+        Arc::new(RwLock::new(Tensor {
+            data: new_data,
+            shape,
+            grad: None,
+            requires_grad: req,
+            op: OpType::Neg,
+            parents: vec![arg],
+        }))
+    }
+    pub fn exp_graph(arg: Arc<RwLock<Tensor>>) -> Arc<RwLock<Tensor>> {
+        let (data, shape, req) = {
+            let r = arg.read().unwrap();
+            (r.data.clone(), r.shape.clone(), r.requires_grad)
+        };
+
+        // Complexのexp: e^(a+bi) = e^a * (cos(b) + i*sin(b))
+        // RustのComplex型で計算させるため、一度Complex型として計算します
+        let new_data: Vec<Complex> = data.iter().map(|z| {
+             // 自作Complexにメソッドがない場合は手動計算、あるいはnum_complexを使う手もありますが
+             // ここでは簡易的に実装します
+             let r = z.re;
+             let i = z.im;
+             let exp_r = r.exp();
+             Complex::new(exp_r * i.cos(), exp_r * i.sin())
+        }).collect();
+
+        Arc::new(RwLock::new(Tensor {
+            data: new_data,
+            shape,
+            grad: None,
+            requires_grad: req,
+            op: OpType::Exp, // ★OpType::Exp
+            parents: vec![arg],
+        }))
+    }
+    pub fn laplacian_graph(arg: Arc<RwLock<Tensor>>) -> Arc<RwLock<Tensor>> {
+        let (out_tensor, shape, req) = {
+            let r = arg.read().unwrap();
+            // 既存の discrete_laplacian を呼んでデータ計算
+            let out = r.discrete_laplacian(); 
+            (out, r.shape.clone(), r.requires_grad)
+        };
+
+        Arc::new(RwLock::new(Tensor {
+            data: out_tensor.data,
+            shape: shape,
+            grad: None,
+            requires_grad: req,
+            op: OpType::Laplacian, // ★OpType::Laplacian
+            parents: vec![arg],
+        }))
+    }
+
+    // ==========================================
+    // Backward Logic
+    // ==========================================
+    
+    pub fn backward(&mut self) {
+        if self.grad.is_none() {
+            let size = self.data.len();
+            self.grad = Some(vec![Complex::new(1.0, 0.0); size]);
+        }
+        self.propagate();
+    }
+
+    fn propagate(&mut self) {
+        if self.grad.is_none() { return; }
+        let my_grad = self.grad.as_ref().unwrap().clone();
+
+        match self.op {
+            OpType::Leaf | OpType::Rem => {},
+            
+            OpType::Add => {
+                for parent_arc in &self.parents {
+                    let mut parent = parent_arc.write().unwrap();
+                    if parent.requires_grad {
+                        parent.accumulate_grad(&my_grad);
+                        parent.propagate();
+                    }
+                }
+            }
+            OpType::Sub => {
+                if self.parents.len() == 2 {
+                    // Left
+                    {
+                        let mut left = self.parents[0].write().unwrap();
+                        if left.requires_grad {
+                            left.accumulate_grad(&my_grad);
+                            left.propagate();
+                        }
+                    }
+                    // Right (-1)
+                    {
+                        let mut right = self.parents[1].write().unwrap();
+                        if right.requires_grad {
+                            let neg_grad: Vec<Complex> = my_grad.iter().map(|g| Complex::new(-g.re, -g.im)).collect();
+                            right.accumulate_grad(&neg_grad);
+                            right.propagate();
+                        }
+                    }
+                }
+            }
+            OpType::Mul => {
+                if self.parents.len() == 2 {
+                    // 親のデータを取得（ロック時間を最小にするためクローン）
+                    let left_data = self.parents[0].read().unwrap().data.clone();
+                    let left_shape = self.parents[0].read().unwrap().shape.clone();
+                    
+                    let right_data = self.parents[1].read().unwrap().data.clone();
+                    let right_shape = self.parents[1].read().unwrap().shape.clone();
+                    
+                    // --- Left (a) への逆伝播 ---
+                    // z = a * b
+                    // もし a, b が同サイズなら dz/da = b * grad
+                    // もし a がスカラなら、 dz/da = sum(b * grad)
+                    {
+                        let mut left = self.parents[0].write().unwrap();
+                        if left.requires_grad {
+                            // 計算ロジック
+                            let is_scalar = left_shape.len() == 1 && left_shape[0] == 1;
+                            let partner_is_scalar = right_shape.len() == 1 && right_shape[0] == 1;
+
+                            if !is_scalar && !partner_is_scalar {
+                                // [N] * [N] -> 通常
+                                let g: Vec<Complex> = my_grad.iter().zip(right_data.iter())
+                                    .map(|(dy, r)| *dy * *r).collect();
+                                left.accumulate_grad(&g);
+                                left.propagate();
+                            } else if is_scalar {
+                                // [1] * [N] -> スカラ側への勾配は内積(合計)
+                                // grad = sum( my_grad[i] * right_data[i] )
+                                let mut sum = Complex::new(0.0, 0.0);
+                                for (dy, r) in my_grad.iter().zip(right_data.iter()) {
+                                    sum = sum + (*dy * *r);
+                                }
+                                left.accumulate_grad(&[sum]); // スカラとして加算
+                                left.propagate();
+                            } else {
+                                // [N] * [1] -> ベクトル側への勾配
+                                // grad[i] = my_grad[i] * right_scalar
+                                let s = right_data[0];
+                                let g: Vec<Complex> = my_grad.iter().map(|dy| *dy * s).collect();
+                                left.accumulate_grad(&g);
+                                left.propagate();
+                            }
+                        }
+                    }
+                    
+                    // --- Right (b) への逆伝播 ---
+                    {
+                        let mut right = self.parents[1].write().unwrap();
+                        if right.requires_grad {
+                            let is_scalar = right_shape.len() == 1 && right_shape[0] == 1;
+                            let partner_is_scalar = left_shape.len() == 1 && left_shape[0] == 1;
+
+                            if !is_scalar && !partner_is_scalar {
+                                // [N] * [N]
+                                let g: Vec<Complex> = my_grad.iter().zip(left_data.iter())
+                                    .map(|(dy, l)| *dy * *l).collect();
+                                right.accumulate_grad(&g);
+                                right.propagate();
+                            } else if is_scalar {
+                                // [N] * [1] -> スカラ側への勾配は内積
+                                let mut sum = Complex::new(0.0, 0.0);
+                                for (dy, l) in my_grad.iter().zip(left_data.iter()) {
+                                    sum = sum + (*dy * *l);
+                                }
+                                right.accumulate_grad(&[sum]);
+                                right.propagate();
+                            } else {
+                                // [1] * [N] -> ベクトル側
+                                let s = left_data[0];
+                                let g: Vec<Complex> = my_grad.iter().map(|dy| *dy * s).collect();
+                                right.accumulate_grad(&g);
+                                right.propagate();
+                            }
+                        }
+                    }
+                }
+            }
+            OpType::Div => {
+                if self.parents.len() == 2 {
+                    let a_data = self.parents[0].read().unwrap().data.clone();
+                    let b_data = self.parents[1].read().unwrap().data.clone();
+
+                    // Left (a): grad * 1/b
+                    {
+                        let mut left = self.parents[0].write().unwrap();
+                        if left.requires_grad {
+                            let g: Vec<Complex> = my_grad.iter().zip(b_data.iter())
+                                .map(|(dy, b)| *dy / *b).collect();
+                            left.accumulate_grad(&g);
+                            left.propagate();
+                        }
+                    }
+
+                    // Right (b): grad * -a/b^2
+                    {
+                        let mut right = self.parents[1].write().unwrap();
+                        if right.requires_grad {
+                            let g: Vec<Complex> = my_grad.iter().zip(a_data.iter()).zip(b_data.iter())
+                                .map(|((dy, a), b)| {
+                                    let b2 = *b * *b;
+                                    let term = *a / b2;
+                                    *dy * Complex::new(-term.re, -term.im)
+                                }).collect();
+                            right.accumulate_grad(&g);
+                            right.propagate();
+                        }
+                    }
+                }
+            }
+            OpType::Neg => {
+                if self.parents.len() == 1 {
+                    let mut parent = self.parents[0].write().unwrap();
+                    if parent.requires_grad {
+                        let g: Vec<Complex> = my_grad.iter().map(|y| Complex::new(-y.re, -y.im)).collect();
+                        parent.accumulate_grad(&g);
+                        parent.propagate();
+                    }
+                }
+            }
+            OpType::Exp => {
+                if self.parents.len() == 1 {
+                    let mut parent = self.parents[0].write().unwrap();
+                    if parent.requires_grad {
+                        // 微分は自分自身の値(y) * grad
+                        let my_val = self.data.clone(); // y = e^x
+                        let new_grad: Vec<Complex> = my_grad.iter().zip(my_val.iter())
+                            .map(|(g, y)| *g * *y)
+                            .collect();
+                        
+                        parent.accumulate_grad(&new_grad);
+                        parent.propagate();
+                    }
+                }
+            }
+            OpType::Laplacian => {
+                if self.parents.len() == 1 {
+                    let mut parent = self.parents[0].write().unwrap();
+                    if parent.requires_grad {
+                        // 勾配の逆伝播:
+                        // dE/dx = Laplacian(dE/dy)
+                        // (ラプラシアン行列は対称なので転置しても同じ)
+                        
+                        // 1. my_grad を Tensor 化してラプラシアンを計算させる
+                        //    (少し非効率ですが、discrete_laplacianの実装を再利用するため)
+                        let grad_tensor = Tensor {
+                            data: my_grad,
+                            shape: parent.shape.clone(),
+                            grad: None, requires_grad: false, op: OpType::Leaf, parents: vec![]
+                        };
+                        let grad_lap = grad_tensor.discrete_laplacian();
+                        
+                        // 2. 結果を親の勾配に加算
+                        parent.accumulate_grad(&grad_lap.data);
+                        parent.propagate();
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn accumulate_grad(&mut self, grad_to_add: &[Complex]) {
+        if self.grad.is_none() {
+            self.grad = Some(grad_to_add.to_vec());
+        } else {
+            let my_grad = self.grad.as_mut().unwrap();
+            for (i, g) in grad_to_add.iter().enumerate() {
+                if i < my_grad.len() {
+                    my_grad[i] = my_grad[i] + *g;
+                }
+            }
+        }
     }
 }

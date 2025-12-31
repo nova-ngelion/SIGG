@@ -437,6 +437,25 @@ impl<'a> Parser<'a> {
                     Ok(Expr::Var(name))
                 }
             }
+            Some(Tok::LBracket) => {
+                self.bump()?; // '[' を消費
+                let mut items = Vec::new();
+                
+                // 空リスト ']' でなければ中身を解析
+                if self.cur_kind() != Some(&Tok::RBracket) {
+                    loop {
+                        items.push(self.parse_expr_bp(0)?);
+                        
+                        if self.cur_kind() == Some(&Tok::Comma) {
+                            self.bump()?;
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                self.expect(Tok::RBracket)?; // ']' を消費
+                Ok(Expr::List(items))
+            }
             other => Err(SiggError::parse(format!("unexpected token in expr: {other:?}"))),
         }
     }

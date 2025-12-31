@@ -1,10 +1,15 @@
 use std::collections::HashMap;
-use std::sync::Arc;
-
+use std::sync::{Arc, Mutex, RwLock};
+use crate::state::PocketState;
+use crate::lexer::Lexer;
+use crate::token::Tok;
 use crate::builtins;
+use crate::pocket::tensor::{Tensor, Complex};
 use crate::bytecode::{CompiledProgram, FnId, Op};
 use crate::error::SiggError;
 use crate::value::{Grid, GridRef, Value};
+use std::net::TcpStream;
+use std::io::Write;
 
 type BuiltinFn = fn(Vec<Value>) -> Result<Value, SiggError>;
 
@@ -20,19 +25,205 @@ struct Frame {
     scope_stack: Vec<HashMap<String, u16>>, // for block scope
 }
 
+/// インタプリタが扱う値の型
+#[derive(Clone)]
+pub enum RuntimeValue {
+    Tensor(Arc<RwLock<Tensor>>),
+    Number(f64),
+}
+
+/// 変数の有効範囲（スコープ）を管理
+pub struct Environment {
+    pub parent: Option<Arc<RwLock<Environment>>>,
+    pub values: HashMap<String, RuntimeValue>,
+    // server.rs の PocketState への参照（空間への直接アクセス用）
+    pub pocket_state: Arc<Mutex<PocketState>>,
+    pub variables: HashMap<String, Value>,
+    pub current_stream: Option<TcpStream>,
+}
+
+pub struct SiggInterpreter {
+    pub pocket_state: Arc<Mutex<PocketState>>,
+    pub variables: HashMap<String, Value>,
+    pub current_stream: Option<TcpStream>, // これを確実に入れる
+}
+impl SiggInterpreter {
+    pub fn new(pocket_state: Arc<Mutex<PocketState>>) -> Self {
+        Self {
+            pocket_state,
+            variables: HashMap::new(),
+            current_stream: None,
+        }
+    }
+
+    /// 受信したソースコードを実行し、server.rs の空間を操作する
+    pub fn run(&mut self, source: &str) -> Result<(), String> {
+        let mut lexer = Lexer::new(source);
+        // 本来はここで Parser を通して AST を作りますが、
+        // 接続の具体化としてトークンを直接評価する流れを示します
+        
+        while let Ok(Some(token)) = lexer.next_token() {
+            match token.kind {
+                Tok::Let => self.handle_let(&mut lexer)?,
+                Tok::Repeat => self.handle_repeat(&mut lexer)?,
+                // server.rs の AI_TICK 等と連動させる処理をここに挟む
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn handle_let(&mut self, lexer: &mut Lexer) -> Result<(), String> {
+        // 例: let w = tensor([1]);
+        // 1. 変数名 (w) を取得
+        // 2. tensor 関数呼び出しを解析
+        // 3. Tensor::zeros(shape) を呼び出し、variables に登録
+        // 4. 同時に、server.rs の PocketState に「新しい構造が生まれた」ことを報告
+        let mut st = self.pocket_state.lock().unwrap();
+        // st.next_handle を更新するなど、server.rs の流儀に従う
+        Ok(())
+    }
+
+    fn handle_repeat(&mut self, lexer: &mut Lexer) -> Result<(), String> {
+        // repeat (n) { ... }
+        // server.rs の TAG_RUN_ONCE に相当するループを実行
+        // ループごとに Tensor::backward() や discrete_laplacian() を呼び出す
+        Ok(())
+    }
+}
+
 pub struct VM {
-    builtins: HashMap<String, BuiltinFn>,
-    seed: u64,
+    pub builtins: HashMap<String, fn(Vec<Value>) -> Result<Value, SiggError>>,
+    pub globals: HashMap<String, Value>,
+    pub seed: u64,
+    pub current_stream: Option<TcpStream>,
 }
 
 impl VM {
+    // src/vm.rs の VM::new() 内
     pub fn new() -> Self {
         let mut m: HashMap<String, BuiltinFn> = HashMap::new();
+        let mut g: HashMap<String, Value> = HashMap::new();
+
         for b in builtins::builtins() {
             m.insert(b.name.to_string(), b.f);
+            g.insert(b.name.to_string(), Value::NativeFunction(b.f));
         }
-        Self { builtins: m, seed: 0 }
+
+        // --- ここを追加 ---
+        // visualize という名前だけ globals に登録しておく（コンパイラに見つけさせるため）
+        // 値は何でも良いですが、識別しやすいように None 以外を入れます
+        g.insert("visualize".to_string(), Value::Number(0.0)); 
+        // ------------------
+
+        Self { 
+            builtins: m, 
+            globals: g,
+            seed: 0,
+            current_stream: None, 
+        }
     }
+    // ストリームを外からセットするためのメソッドを追加
+    pub fn set_stream(&mut self, stream: TcpStream) {
+        self.current_stream = Some(stream);
+    }
+    // 2Dラプラシアンの実装
+    pub fn compute_laplacian_2d(&mut self, tensor_val: Value) -> Result<Value, SiggError> {
+        if let Value::Tensor(arc_tensor) = tensor_val {
+            let tensor = arc_tensor.read().unwrap();
+            let w = tensor.shape[0];
+            let h = if tensor.shape.len() > 1 { tensor.shape[1] } else { 1 };
+            
+            let mut new_data = vec![Complex::new(0.0, 0.0); w * h];
+            for y in 1..h-1 {
+                for x in 1..w-1 {
+                    let idx = y * w + x;
+                    // 実部(re)を取り出して計算
+                    let center = tensor.data[idx].re;
+                    let neighbors = tensor.data[idx+1].re + tensor.data[idx-1].re + 
+                                   tensor.data[idx+w].re + tensor.data[idx-w].re;
+                    new_data[idx] = Complex::new(neighbors - 4.0 * center, 0.0);
+                }
+            }
+            let mut out = Tensor::zeros(vec![w, h]);
+            out.data = new_data;
+            Ok(Value::Tensor(Arc::new(RwLock::new(out))))
+        } else {
+            Err(SiggError::runtime("Expected tensor for laplacian_2d"))
+        }
+    }
+    // 可視化データの送信
+    pub fn send_visualize_data(&mut self, val: Value) -> Result<Value, SiggError> {
+        println!("DEBUG: send_visualize_data called!"); // ←これを追加
+        if let Value::Tensor(t_lock) = val {
+            let t = t_lock.read().unwrap();
+            // ここでタグ 0x50 とデータを準備
+            let mut buffer = vec![0x50];
+            for c in &t.data {
+                buffer.extend_from_slice(&(c.re as f32).to_le_bytes());
+            }
+    
+            // フィールド名を self.current_stream に修正
+            if let Some(ref mut stream) = self.current_stream {
+                use std::io::Write;
+                stream.write_all(&buffer).map_err(|e| SiggError::runtime(e.to_string()))?;
+                stream.flush().map_err(|e| SiggError::runtime(e.to_string()))?;
+                //println!("DEBUG: Sent {} bytes to Python", buffer.len());
+            } else {
+                //println!("DEBUG: No active stream to send data!"); // ←これが出たら接続が切れています
+            }
+        }
+        // 戻り値を Result<(), ...> ではなく Result<Value, ...> に合わせる
+        Ok(Value::Number(0.0)) 
+    }
+    pub fn native_t_set_2d(&mut self, args: Vec<Value>) -> Result<Value, SiggError> {
+        if args.len() < 4 {
+            return Err(SiggError::runtime("t_set_2d requires 4 arguments"));
+        }
+
+        if let Value::Tensor(arc_tensor) = &args[0] {
+            let mut tensor = arc_tensor.write().unwrap();
+            
+            // args[1] (x) と args[2] (y) を数値として取得
+            let x = match args[1] {
+                Value::Number(n) => n as usize,
+                Value::F32(f) => f as usize,
+                _ => return Err(SiggError::runtime("x must be a number")),
+            };
+            let y = match args[2] {
+                Value::Number(n) => n as usize,
+                Value::F32(f) => f as usize,
+                _ => return Err(SiggError::runtime("y must be a number")),
+            };
+
+            // args[3] は [re, im] の配列(List/Array)か
+            // あなたの定義に合わせて修正（Value::List の場合が多いです）
+            let (re, im) = match &args[3] {
+                Value::List(list) => {
+                    let r = match list[0] { Value::Number(n) => n as f32, Value::F32(f) => f, _ => 0.0 };
+                    let i = if list.len() > 1 {
+                        match list[1] { Value::Number(n) => n as f32, Value::F32(f) => f, _ => 0.0 }
+                    } else { 0.0 };
+                    (r, i)
+                },
+                _ => return Err(SiggError::runtime("Value must be a list [re, im]")),
+            };
+
+            let w = tensor.shape[0];
+            let h = if tensor.shape.len() > 1 { tensor.shape[1] } else { 1 };
+
+            if x < w && y < h {
+                let idx = y * w + x;
+                tensor.data[idx] = Complex::new(re as f64, im as f64);
+                Ok(Value::Number(0.0))
+            } else {
+                Err(SiggError::runtime("Index out of bounds"))
+            }
+        } else {
+            Err(SiggError::runtime("First arg must be tensor"))
+        }
+    }
+
 
     fn build_stack_trace(&self, prog: &CompiledProgram, callstack: &[Frame]) -> Vec<String> {
         callstack.iter().rev().map(|f| {
@@ -51,9 +242,13 @@ impl VM {
         prog: &CompiledProgram,
         callstack: &mut Vec<Frame>,
     ) -> Result<Value, SiggError> {
+        //println!("DEBUG: VM is trying to call: {}", func); // これで何が呼ばれているか全表示
         match func {
             Value::Lambda(id) | Value::Function { id, .. } => {
                 self.call_lambda(*id, args, prog, callstack)
+            }
+            Value::NativeFunction(f) => {
+                f(args)
             }
             Value::Closure { fn_id, upvalues } => {
                 // クロージャの場合、upvaluesをローカル変数として設定
@@ -61,7 +256,25 @@ impl VM {
                 extended_args.extend(args);
                 self.call_lambda(*fn_id, extended_args, prog, callstack)
             }
-            Value::HostFunction { func, .. } => {
+            Value::HostFunction { func, name } => {
+                // 1. まず、VM自体が持つ特殊命令（2D拡張）かどうかをチェック
+                match name.as_str() {
+                    "t_set_2d" => {
+                        return self.native_t_set_2d(args);      // return を付ける
+                    }
+                    "laplacian_2d" => {
+                        let arg = args[0].clone();
+                        return self.compute_laplacian_2d(arg);
+                    }
+                    "visualize" => {
+                        //println!("DEBUG: VM is calling visualize function!!!"); // これを追加
+                        let arg = args[0].clone();
+                        return self.send_visualize_data(arg);
+                    }                  
+                    _ => {} // 次へ進む
+                }
+            
+                // 2. 特殊命令でなければ、従来のHostFunctionとして実行
                 func(args)
             }
             _ => Err(SiggError::runtime("not a callable value")),
@@ -159,6 +372,7 @@ impl VM {
     }
 
     pub fn exec_compiled(&mut self, prog: &CompiledProgram) -> Result<(), SiggError> {
+        //println!("DEBUG: exec_compiled started"); // ★ログ
         let mut stack: Vec<Value> = Vec::new();
         let mut callstack: Vec<Frame> = Vec::new();
 
@@ -169,6 +383,13 @@ impl VM {
             let name = prog.table.name(id).to_string();
             global_scope.insert(name, global_locals.len() as u16);
             global_locals.push(Value::Lambda(id));
+        }
+        for (name, func) in &self.builtins {
+            // 重複チェック（ユーザー定義関数と同名ならユーザー優先、または上書き）
+            if !global_scope.contains_key(name) {
+                global_scope.insert(name.clone(), global_locals.len() as u16);
+                global_locals.push(Value::NativeFunction(*func));
+            }
         }
         {
             let (main_chunk, main_span) = prog
@@ -188,7 +409,6 @@ impl VM {
                 scope_stack: vec![global_scope], // global scope with functions
             });
         }
-
         loop {
             let stack_trace = self.build_stack_trace(prog, &callstack);
             let Some(frame) = callstack.last_mut() else { break; };
@@ -205,7 +425,9 @@ impl VM {
             }
 
             let op = chunk.ops[frame.ip].clone();
+            //println!("DEBUG: Executing OP: {:?}", op); // ★ これを追加
             frame.ip += 1;
+            //println!("DEBUG: Executing Op {:?}", op);
 
             match op {
                 Op::Const(ci) => {
@@ -231,21 +453,152 @@ impl VM {
                     frame.locals[idx] = v;
                 }
                 Op::Pop => { let _ = stack.pop(); }
-
-                Op::Neg => {
-                    let a = stack.pop().ok_or_else(|| SiggError::runtime("stack underflow"))?;
-                    stack.push(neg(a)?);
+                Op::Add => {
+                    let rhs = stack.pop().ok_or(SiggError::runtime("Stack underflow"))?;
+                    let lhs = stack.pop().ok_or(SiggError::runtime("Stack underflow"))?;
+                    
+                    match (lhs, rhs) {
+                        (Value::Number(a), Value::Number(b)) => stack.push(Value::Number(a + b)),
+                        (Value::Tensor(t1_lock), Value::Tensor(t2_lock)) => {
+                            let mut t1 = t1_lock.write().unwrap(); // 書き込みロック
+                            let t2 = t2_lock.read().unwrap();      // 読み取りロック
+                            
+                            if t1.data.len() == t2.data.len() {
+                                for (v1, v2) in t1.data.iter_mut().zip(t2.data.iter()) {
+                                    v1.re += v2.re;
+                                    v1.im += v2.im;
+                                }
+                            }
+                            drop(t1); // ロック解除
+                            drop(t2);
+                            stack.push(Value::Tensor(t1_lock));
+                        }
+                        _ => return Err(SiggError::runtime("Invalid types for add")),
+                    }
                 }
-                Op::Add => binop(&mut stack, add, current_span, &stack_trace)?,
-                Op::Sub => binop(&mut stack, sub, current_span, &stack_trace)?,
-                Op::Mul => binop(&mut stack, mul, current_span, &stack_trace)?,
-                Op::Div => binop(&mut stack, div, current_span, &stack_trace)?,
-                Op::Mod => binop(&mut stack, |a,b| {
-                    let x = as_f64(&a)? as i64;
-                    let y = as_f64(&b)? as i64;
-                    if y == 0 { return Err(SiggError::runtime("modulo by zero")); }
-                    Ok(Value::Number((x % y) as f64))
-                }, current_span, &stack_trace)?,
+                // --- 引き算 (-) ---
+                Op::Sub => {
+                    let b = stack.pop().ok_or(SiggError::runtime("Stack underflow"))?;
+                    let a = stack.pop().ok_or(SiggError::runtime("Stack underflow"))?;
+                    
+                    let res = crate::builtins::builtin_sub(vec![a, b])?;
+                    stack.push(res);
+                }
+                // --- 掛け算 (*) ---
+                Op::Mul => {
+                    let rhs = stack.pop().ok_or(SiggError::runtime("Stack underflow"))?;
+                    let lhs = stack.pop().ok_or(SiggError::runtime("Stack underflow"))?;
+                    
+                    match (lhs, rhs) {
+                        (Value::Number(a), Value::Number(b)) => stack.push(Value::Number(a * b)),
+                        (Value::Tensor(t_lock), Value::Number(n)) | (Value::Number(n), Value::Tensor(t_lock)) => {
+                            let mut t = t_lock.write().unwrap();
+                            
+                            // n_f32 ではなく n_f64 として、f64 にキャストする
+                            let n_f64 = n as f64; 
+                            
+                            for val in t.data.iter_mut() {
+                                // これで f64 *= f64 の計算になり、エラーが消えます
+                                val.re *= n_f64;
+                                val.im *= n_f64;
+                            }
+                            drop(t);
+                            stack.push(Value::Tensor(t_lock));
+                        }
+                        _ => return Err(SiggError::runtime("Invalid types for mul")),
+                    }
+                }
+                
+                // --- 割り算 (/) ---
+                Op::Div => {
+                    let b = stack.pop().ok_or(SiggError::runtime("Stack underflow"))?;
+                    let a = stack.pop().ok_or(SiggError::runtime("Stack underflow"))?;
+                    let res = crate::builtins::builtin_div(vec![a, b])?;
+                    stack.push(res);
+                }
+                // --- 剰余 (%) ---
+                Op::Mod => {
+                    let b = stack.pop().ok_or(SiggError::runtime("Stack underflow"))?;
+                    let a = stack.pop().ok_or(SiggError::runtime("Stack underflow"))?;
+                    let res = crate::builtins::builtin_mod(vec![a, b])?;
+                    stack.push(res);
+                }
+                // --- 単項マイナス (Neg) ---
+                Op::Neg => {
+                    let a = stack.pop().ok_or(SiggError::runtime("Stack underflow"))?;
+                    let res = crate::builtins::builtin_neg(vec![a])?;
+                    stack.push(res);
+                }
+                // src/vm.rs の Op::Visualize 処理
+                // match op { ... } の中
+                Op::Visualize => {
+                    let arg = stack.pop().ok_or(SiggError::runtime("Stack underflow"))?;
+                    // self.send_visualize_data を呼ぶ
+                    self.send_visualize_data(arg)?; 
+                    stack.push(Value::Number(0.0)); // スタックの整合性を保つ
+                    // 描画の安定のため少し待機
+                    std::thread::sleep(std::time::Duration::from_millis(16)); 
+                }
+                Op::StoreElement | Op::StoreIndex => {
+                    let val = stack.pop().ok_or(SiggError::runtime("Stack underflow: value"))?;
+                    let idx_val = stack.pop().ok_or(SiggError::runtime("Stack underflow: index"))?;
+                    let mut target = stack.pop().ok_or(SiggError::runtime("Stack underflow: target"))?;
+                    
+                    //println!("DEBUG: StoreIndex target={:?}, idx={:?}, val={:?}", target, idx_val, val);
+                
+                    match target {
+                        Value::Tensor(ref t_arc) => {
+                            let indices = match idx_val {
+                                Value::Number(n) => vec![n as usize],
+                                Value::Int(i) => vec![i as usize],
+                                Value::List(ref l) | Value::Vec(ref l) => {
+                                    l.iter().map(|v| match v {
+                                        Value::Number(n) => *n as usize,
+                                        Value::Int(i) => *i as usize,
+                                        _ => 0
+                                    }).collect()
+                                },
+                                _ => return Err(SiggError::runtime("Invalid index type")),
+                            };
+                            let c_val = match val {
+                                Value::Number(n) => Complex { re: n, im: 0.0 },
+                                Value::Int(i) => Complex { re: i as f64, im: 0.0 },
+                                _ => return Err(SiggError::runtime("Only numbers can be stored in tensor")),
+                            };
+                            
+                            // 書き換え実行
+                            let mut t = t_arc.write().unwrap();
+                            t.set(&indices, c_val);
+                
+                            // ★重要修正: テンソルもスタックに戻す必要があります！
+                            // 次の命令(StoreLocal)がこれをPopして変数に紐付けるためです。
+                            drop(t); // ロックを明示的に解放（念のため）
+                            stack.push(target); 
+                            Ok(())
+                        }
+                        
+                        Value::List(ref mut list) | Value::Vec(ref mut list) => {
+                            let idx = match idx_val {
+                                Value::Number(n) => n as usize,
+                                Value::Int(i) => i as usize,
+                                _ => return Err(SiggError::runtime("List index must be a number")),
+                            };
+                
+                            if idx < list.len() {
+                                list[idx] = val;
+                                //println!("DEBUG: List updated. New list: {:?}", list);
+                            } else {
+                                return Err(SiggError::runtime("List index out of bounds"));
+                            }
+                            
+                            // 書き換え終わった target をスタックに戻す
+                            stack.push(target); 
+                            Ok(())
+                        }
+                
+                        _ => Err(SiggError::runtime(format!("Target is not indexable: {:?}", target)))
+                    }?; // matchの結果（Result）をチェック
+                }
                 Op::BitAnd => binop(&mut stack, bitand, current_span, &stack_trace)?, // &
                 Op::Eq => binop(&mut stack, eq, current_span, &stack_trace)?, // 新しい演算子: ==
                 Op::Ne => binop(&mut stack, ne, current_span, &stack_trace)?, // 新しい演算子: !=
@@ -279,16 +632,43 @@ impl VM {
                 Op::CallId { id, argc } => {
                     let argc = argc as usize;
                     if stack.len() < argc { return Err(SiggError::runtime("stack underflow (call)")); }
+                    
+                    // 1. まず引数をスタックから取り出す（共通処理）
                     let mut args = Vec::with_capacity(argc);
                     for _ in 0..argc { args.push(stack.pop().unwrap()); }
                     args.reverse();
-
+                    
+                    // 2. 関数名を取得
                     let name = prog.table.name(id).to_string();
-
-                    // builtin only
-                    let f = self.builtins.get(&name).cloned()
-                        .ok_or_else(|| SiggError::runtime(format!("unknown builtin: {name}")))?;
-                    let out = f(args)?;
+                
+                    // 3. 【重要】visualize の横取り処理（ここだけでOK）
+                    if name == "visualize" {
+                        //println!("DEBUG: INTERCEPTED 'visualize' call!");
+                        
+                        // 第1引数（tensor）を取り出して送信
+                        if let Some(arg) = args.get(0) {
+                            self.send_visualize_data(arg.clone())?;
+                        }
+                        
+                        // 戻り値を積んで、次の命令へ進む
+                        stack.push(Value::Number(0.0)); 
+                        continue; 
+                    }
+                
+                    // 4. それ以外の通常の関数呼び出し処理
+                    let name_for_err = name.clone();
+                    let func_val = if let Some(f) = self.builtins.get(&name) {
+                        Value::HostFunction { 
+                            func: Arc::new(*f), 
+                            name: name.clone() 
+                        }
+                    } else if let Some(val) = self.globals.get(&name) {
+                        val.clone()
+                    } else {
+                        return Err(SiggError::runtime(format!("unknown function: {name_for_err}")));
+                    };
+                
+                    let out = self.call_value(&func_val, args, prog, &mut callstack)?;
                     stack.push(out);
                 }
 
@@ -298,73 +678,54 @@ impl VM {
                     let mut args = Vec::with_capacity(argc);
                     for _ in 0..argc { args.push(stack.pop().unwrap()); }
                     args.reverse();
+                    
                     let lambda = stack.pop().unwrap();
                     let id = match lambda {
                         Value::Lambda(id) => id,
                         _ => return Err(SiggError::runtime("call expects lambda")),
                     };
 
-                    let (chunk2, span) = prog
-                        .fns
-                        .get(&id)
-                        .ok_or_else(|| SiggError::runtime(format!("unknown lambda: {:?}", id)))?;
-                    
-                    // ローカル変数のベクターを作成
-                    let mut locals = vec![Value::Unit; chunk2.local_count as usize];
-                    
-                    // 引数をローカル変数に格納
-                    for i in 0..args.len() {
-                        if i < locals.len() {
-                            locals[i] = args[i].clone();
+                    // 1. まずユーザー定義関数 (prog.fns) にバイトコードがあるか探す
+                    if let Some((chunk2, span)) = prog.fns.get(&id) {
+                        // --- A. バイトコードがある場合（通常の関数実行） ---
+                        let mut locals = vec![Value::Unit; chunk2.local_count as usize];
+                        
+                        for i in 0..args.len() {
+                            if i < locals.len() {
+                                locals[i] = args[i].clone();
+                            }
+                        }
+                        
+                        callstack.push(Frame {
+                            fn_id: id,
+                            ip: 0,
+                            locals,
+                            repeat_u32: Vec::new(),
+                            span: Some(*span),
+                            scope_stack: vec![HashMap::new()],
+                        });
+                    } else {
+                        // --- B. バイトコードがない場合（組み込み関数へのフォールバック） ---
+                        let name = prog.table.name(id);
+                        
+                        if name == "visualize" {
+                            // 1. visualize の横取り処理
+                            //println!("DEBUG: INTERCEPTED 'visualize' via CallLambda!");
+                            if let Some(arg) = args.get(0) {
+                                self.send_visualize_data(arg.clone())?;
+                            }
+                            stack.push(Value::Number(0.0));
+                            // ここでこの関数の処理は終わりなので、これ以上下には行かない
+                        } else if let Some(func) = self.builtins.get(name) {
+                            // 2. その他の組み込み関数の実行
+                            let out = func(args)?;
+                            stack.push(out);
+                        } else {
+                            // 3. 本当に見つからない場合
+                            return Err(SiggError::runtime(format!("unknown lambda: {} (ID: {:?})", name, id)));
                         }
                     }
-                    
-                    callstack.push(Frame {
-                        fn_id: id,
-                        ip: 0,
-                        locals,
-                        repeat_u32: Vec::new(),
-                        span: Some(*span),
-                        scope_stack: vec![HashMap::new()],
-                    });
                 }
-
-                // Op::CallDynamic { argc } => {
-                //     let argc = argc as usize;
-                //     if stack.len() < argc + 1 { return Err(SiggError::runtime("stack underflow (dynamic call)")); }
-                //     let mut args = Vec::with_capacity(argc);
-                //     for _ in 0..argc { args.push(stack.pop().unwrap()); }
-                //     args.reverse();
-                //     let callee = stack.pop().unwrap();
-                //     match callee {
-                //         Value::Lambda(id) => {
-                //             let (chunk2, span) = prog
-                //                 .fns
-                //                 .get(&id)
-                //                 .ok_or_else(|| SiggError::runtime(format!("unknown lambda: {:?}", id)))?;
-                            
-                //             // ローカル変数のベクターを作成
-                //             let mut locals = vec![Value::Unit; chunk2.local_count as usize];
-                            
-                //             // 引数をローカル変数に格納
-                //             for i in 0..args.len() {
-                //                 if i < locals.len() {
-                //                     locals[i] = args[i].clone();
-                //                 }
-                //             }
-                            
-                //             callstack.push(Frame {
-                //                 fn_id: id,
-                //                 ip: 0,
-                //                 locals,
-                //                 repeat_u32: Vec::new(),
-                //                 span: Some(*span),
-                //                 scope_stack: vec![HashMap::new()],
-                //             });
-                //         }
-                //         _ => return Err(SiggError::runtime("dynamic call expects lambda")),
-                //     }
-                // }
                 //以下のCallDynamicは、関数を変数に代入して呼び出す機能です。
                 Op::CallDynamic { argc } => {
                     let argc = argc as usize;
@@ -400,12 +761,17 @@ impl VM {
                                 scope_stack: vec![HashMap::new()],
                             });
                         }
+                        Value::NativeFunction(f) => {
+                            let out = f(args)?;
+                            stack.push(out);
+                        }
                         Value::Closure { fn_id: _, upvalues } => {
                             // クロージャの処理
                             let mut extended_args = upvalues;
                             extended_args.extend(args);
                             // ... 以下Lambdaと同じ処理 ...
                         }
+                        
                         _ => return Err(SiggError::runtime(
                             format!("dynamic call expects callable value, got: {:?}", callee)
                         )),
@@ -463,16 +829,20 @@ impl VM {
                 Op::Index => {
                     let index = stack.pop().ok_or_else(|| SiggError::runtime("stack underflow (index)"))?;
                     let expr = stack.pop().ok_or_else(|| SiggError::runtime("stack underflow (expr)"))?;
+                    
+                    //println!("DEBUG: Op::Index calling for target: {:?}, index: {:?}", expr, index);
+                    
                     let val = match expr {
-                        Value::Vec(v) => {
+                        // ★ List と Vec の両方を許可する
+                        Value::List(v) | Value::Vec(v) => {
                             let idx = as_usize(&index)?;
-                            v.get(idx).cloned().ok_or_else(|| SiggError::runtime("vec index out of bounds"))?
+                            v.get(idx).cloned().ok_or_else(|| SiggError::runtime("index out of bounds"))?
                         }
                         Value::Map(m) => {
                             let key = as_string(&index)?;
                             m.get(&key).cloned().ok_or_else(|| SiggError::runtime("map key not found"))?
                         }
-                        _ => return Err(SiggError::runtime("index expects vec or map")),
+                        _ => return Err(SiggError::runtime(format!("index expects vec or map, but got {:?}", expr))),
                     };
                     stack.push(val);
                 }

@@ -112,6 +112,7 @@ pub enum Expr {
     NamespacedVar { namespace: String, name: String },
     Call { callee: Box<Expr>, args: Vec<Expr> },
     Tuple(Vec<Expr>),
+    List(Vec<Expr>),
     Unary { op: UnOp, rhs: Box<Expr> },
     Binary { op: BinOp, lhs: Box<Expr>, rhs: Box<Expr> },
     Group(Box<Expr>),

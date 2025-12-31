@@ -15,6 +15,7 @@ use crate::bytecode;
 use crate::pocket::cpu::CpuState;
 use crate::pocket::compute::ComputeSpace;
 use crate::ai_runtime;
+use crate::vm::SiggInterpreter;
 
 
 // use rayon::prelude::*;
@@ -224,11 +225,14 @@ pub fn serve(addr: &str) -> Result<(), SiggError> {
     }
 
     loop {
-        let (stream, _addr) = listener.accept().map_err(|e| SiggError::io(e.to_string()))?;
-        let ctx2 = ctx.clone();
+        let (mut stream, _addr) = listener.accept().map_err(|e| SiggError::io(e.to_string()))?;
+        let pocket_state_clone = Arc::clone(&pocket_state); // pocket_stateをスレッドに渡す用
+    
         thread::spawn(move || {
-            if let Err(e) = handle_client(stream, ctx2) {
-                eprintln!("[server] client error: {e}");
+            // このスレッド内で直接スクリプト処理を行う
+            //println!("DEBUG: New connection from Python!");
+            if let Err(e) = handle_sigg_script(&mut stream, &pocket_state_clone) {
+                eprintln!("Error handling script: {:?}", e);
             }
         });
     }
@@ -1135,7 +1139,7 @@ fn handle_client(mut stream: TcpStream, ctx: ServerCtx) -> Result<(), SiggError>
             
 
             _ => {
-                write_err(&mut stream, "unknown tag")?;
+                // write_err(&mut stream, "unknown tag")?;
             }
         }
     }
@@ -1200,7 +1204,55 @@ fn cpu_load_prog(stream: &mut TcpStream, pocket_state: &Arc<Mutex<PocketState>>)
     write_ok(stream)?;
     Ok(())
 }
+// server.rs のコマンド処理部分 (TAG_RUN_SCRIPT などを新設)
+fn handle_sigg_script(stream: &mut TcpStream, pocket_state: &Arc<Mutex<PocketState>>) -> Result<(), SiggError> {
+    //println!("DEBUG: Script receive started...");
+    
+    // 1. スクリプトの受信（ここは今のままでOK）
+    let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+    use std::io::BufRead;
+    let mut temp_buffer = Vec::new();
+    reader.read_until(b'\0', &mut temp_buffer).map_err(|e| SiggError::runtime(format!("Read error: {e}")))?;
+    let script_content = String::from_utf8_lossy(&temp_buffer).replace('\0', "").to_string();
 
+    if script_content.trim().is_empty() {
+        return Ok(());
+    }
+
+    //println!("DEBUG: Received script length: {}", script_content.len());
+    println!("--- RECEIVED CODE ---\n{}\n---------------------", script_content);
+
+    // 2. コンパイル (Source -> AST -> Bytecode)
+    // ※SiggParserやbytecodeモジュールが利用可能であることを前提としています
+    let mut parser = crate::parser::Parser::new(&script_content);
+    let ast_prog = parser.parse_program().map_err(|e| SiggError::runtime(format!("Parse error: {:?}", e)))?;
+
+    for f in &ast_prog.fns {
+        //println!("DEBUG: Found function in AST: {}", f.name);
+    }
+
+    let compiled_prog = crate::bytecode::compile(&ast_prog).map_err(|e| SiggError::runtime(format!("Compile error: {:?}", e)))?;
+
+    // 3. VMの初期化とストリームのセット
+    let mut vm = crate::vm::VM::new();
+    // ここで Python への送り口をセット！
+    vm.set_stream(stream.try_clone().expect("Failed to clone stream")); 
+
+    //println!("DEBUG: Starting execution via VM...");
+    
+    // 4. バイトコードの実行
+    match vm.exec_compiled(&compiled_prog) {
+        Ok(_) => println!(""),//println!("DEBUG: VM Script execution finished successfully."),
+        Err(e) => {
+            //println!("DEBUG: VM RUNTIME ERROR: {:?}", e);
+            return Err(e);
+        }
+    }
+
+    Ok(())
+}
+
+// 2. CPU用にアセンブリをロードするハンドラ
 fn cpu_asm_load(stream: &mut TcpStream, pocket_state: &Arc<Mutex<PocketState>>) -> Result<(), SiggError> {
     let h = read_u32(stream)?;
     let space_id = read_u32(stream)?;
@@ -1208,8 +1260,9 @@ fn cpu_asm_load(stream: &mut TcpStream, pocket_state: &Arc<Mutex<PocketState>>) 
     let text_bytes = read_exact(stream, text_len)?;
     let text = String::from_utf8_lossy(&text_bytes);
 
+    // ここは「実行」ではなく「アセンブル」を呼ぶ
     let prog = crate::pocket::asm::assemble(&text)
-        .map_err(|e| SiggError::runtime(&format!("asm error: {e}")))?;
+        .map_err(|e| SiggError::runtime(format!("asm error: {e}")))?;
 
     // CPU を取得して初期化 + base座標を抜き出す
     let mut st = pocket_state.lock().unwrap();

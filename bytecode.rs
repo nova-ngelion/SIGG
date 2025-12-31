@@ -5,6 +5,7 @@ use crate::ast::*;
 use crate::error::SiggError;
 use crate::value::Value;
 use crate::span::Span;
+// use crate::builtins;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct FnId(pub u16);
@@ -31,6 +32,9 @@ pub enum Op {
     And, // 新しい演算子: &&
     Or,  // 新しい演算子: ||
     Neg,
+    Visualize,
+    StoreElement, // スタックから [Tensor, Index, Value] をポップして代入するs
+    StoreIndex,
 
     MakeTuple(u16),
     UnpackTuple(u16), // pop tuple -> push elements (0..n-1)
@@ -128,6 +132,9 @@ impl<'a> FnCompiler<'a> {
     fn new(table: &'a mut FnTable) -> Self {
         Self { locals: HashMap::new(), chunk: Chunk::new(), table, next_repeat_slot: 0, lambda_fns: vec![] }
     }
+    fn resolve_local(&self, name: &str) -> Option<u16> {
+        self.locals.get(name).copied()
+    }
 
     fn alloc_repeat_slot(&mut self) -> u16 {
         let s = self.next_repeat_slot;
@@ -193,22 +200,32 @@ impl<'a> FnCompiler<'a> {
                 self.chunk.emit(Op::PopScope);
                 Ok(())
             }
-            Stmt::Assign { lhs, expr } => {
+            Stmt::Assign { lhs, expr: rhs_expr } => {
                 match lhs {
-                    Expr::Var(name) => {
-                        self.compile_expr(expr)?;
-                        let idx = self.local_index(name);
-                        self.chunk.emit(Op::StoreLocal(idx));
-                        Ok(())
-                    }
                     Expr::Index { expr: base, index } => {
                         self.compile_expr(base)?;
                         self.compile_expr(index)?;
-                        self.compile_expr(expr)?;
-                        // TODO: Op::StoreIndex を実装
-                        Err(SiggError::runtime("indexed assignment not yet implemented"))
+                        self.compile_expr(rhs_expr)?;
+                        
+                        self.chunk.emit(Op::StoreIndex); 
+            
+                        // 重要：リスト（値型）の場合、StoreIndexがスタックに積んだ「新しいリスト」を元の変数に書き戻す
+                        if let Expr::Var(name) = &**base {
+                            // 変数名からスロット番号を解決する（メソッド名は既存のコードに合わせてください）
+                            if let Some(slot) = self.resolve_local(name) {
+                                self.chunk.emit(Op::StoreLocal(slot as u16));
+                            }
+                        }
+                        Ok(())
                     }
-                    _ => Err(SiggError::runtime("invalid assignment target"))
+                    Expr::Var(name) => {
+                        self.compile_expr(rhs_expr)?;
+                        if let Some(slot) = self.resolve_local(name) {
+                            self.chunk.emit(Op::StoreLocal(slot as u16));
+                        }
+                        Ok(())
+                    }
+                    _ => Err(SiggError::runtime(format!("Invalid assignment target: {:?}", lhs)))
                 }
             }
             Stmt::Expr(e) => {
@@ -604,10 +621,14 @@ impl<'a> FnCompiler<'a> {
                 Ok(()) // ★ 追加
             }
             Expr::Index { expr, index } => {
+                // 1. 対象（TensorやListなど）を評価してスタックに積む
                 self.compile_expr(expr)?;
+                // 2. インデックスを評価してスタックに積む
                 self.compile_expr(index)?;
-                self.chunk.emit(Op::Index);
-                Ok(()) // ★ 追加
+                
+                // 3. 値を取り出す命令を発行
+                self.chunk.emit(Op::Index); 
+                Ok(())
             }
             Expr::Field { expr, name } => {
                 self.compile_expr(expr)?;
@@ -643,6 +664,26 @@ impl<'a> FnCompiler<'a> {
                 let _ = (namespace, enum_name, variant, data);
                 Err(SiggError::runtime("enum initialization not yet implemented"))
             }
+            Expr::List(items) => {
+                // 1. 中身の式を順番にコンパイルしてスタックに積む
+                for item in items {
+                    self.compile_expr(item)?;
+                }
+    
+                // 2. "list" という名前の関数IDを取得（なければ登録）
+                let name = "list";
+                if !self.table.name_to_id.contains_key(name) {
+                    self.table.intern(name);
+                }
+                let id = *self.table.name_to_id.get(name).unwrap();
+    
+                // 3. 関数呼び出し命令を発行
+                self.chunk.emit(Op::CallId {
+                    id,
+                    argc: items.len() as u16, // ※ u8 か u16 かは Op の定義に合わせてください
+                });
+                Ok(())
+            }
         }
     }
     fn lookup_local(&self, name: &str) -> Option<u16> {
@@ -669,6 +710,17 @@ pub fn compile(p: &Program) -> Result<CompiledProgram, SiggError> {
             .map_err(|e| SiggError::parse(format!("in {}: {}", import_path, e)))?;
         all_fns.extend(imported_prog.fns);
     }
+    for b in crate::builtins::builtins() {
+        let dummy_fn = FnDef {
+            name: b.name.to_string(),
+            params: vec![],
+            ret_type: None,
+            body: vec![],
+            span: Span::new(0, 0, 0), // Span::default() がなければ new(0,0,0)
+            namespace: None,
+        };
+        all_fns.push(dummy_fn);
+    }
 
     let mut table = FnTable::new();
     for f in &all_fns { table.intern(&f.name); }
@@ -676,16 +728,37 @@ pub fn compile(p: &Program) -> Result<CompiledProgram, SiggError> {
     let mut fns_map: HashMap<FnId, (Chunk, Span)> = HashMap::new();
     let mut all_lambdas = vec![];
 
+    // ★ 1. ループに入る前に「組み込み関数の名前リスト」を作っておきます
+    let builtin_names: std::collections::HashSet<String> = crate::builtins::builtins()
+        .into_iter()
+        .map(|b| b.name.to_string())
+        .collect();
+
     for f in &all_fns {
-        let id = *table.name_to_id.get(&f.name).unwrap();
+        // ★ 2. まず最初に関数名 (fn_name) を確定させます
+        let fn_name = if let Some(ns) = &f.namespace {
+            format!("{}::{}", ns, f.name)
+        } else {
+            f.name.clone()
+        };
+
+        // ★ 3. fn_name ができた後で、チェックを行います
+        // 組み込み関数なら、バイトコードの生成をスキップします
+        if builtin_names.contains(&fn_name) {
+            continue;
+        }
+
+        // 以下、通常のコンパイル処理
+        let id = *table.name_to_id.get(&fn_name).unwrap();
         let mut fc = FnCompiler::new(&mut table);
         
-        // ★ 修正: params は Vec<(String, Option<TypeAnnotation>)>
-        for (param_name, _param_type) in &f.params {
+        for (param_name, _) in &f.params {
             fc.local_index(param_name);
         }
         
-        for st in &f.body { fc.compile_stmt(st)?; }
+        for st in &f.body {
+            fc.compile_stmt(st)?;
+        }
         fc.chunk.emit(Op::Return);
         fns_map.insert(id, (fc.chunk, f.span));
         all_lambdas.extend(fc.lambda_fns);

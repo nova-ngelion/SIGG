@@ -193,6 +193,154 @@ fn builtin_pocket_atlas_update_from_hits(args: Vec<Value>) -> Result<Value, Sigg
 }
 
 
+pub fn builtin_add(args: Vec<Value>) -> Result<Value, SiggError> {
+    if args.len() != 2 {
+        return Err(SiggError::runtime("add expects 2 arguments"));
+    }
+    match (&args[0], &args[1]) {
+        // 数値 + 数値
+        (Value::Int(a), Value::Int(b)) => Ok(Value::Int(a + b)),
+        (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a + b)),
+        (Value::Number(a), Value::Number(b)) => Ok(Value::Number(a + b)), // Number型がある場合
+        
+        // Tensor + Tensor (Autograd対応)
+        (Value::Tensor(a), Value::Tensor(b)) => {
+            let res = Tensor::add_graph(a.clone(), b.clone());
+            Ok(Value::Tensor(res))
+        },
+
+        // 型不一致などの場合
+        _ => Err(SiggError::runtime("Invalid types for add (supports Number or Tensor)")),
+    }
+}
+
+// 引き算 (-)
+pub fn builtin_sub(args: Vec<Value>) -> Result<Value, SiggError> {
+    if args.len() != 2 {
+        return Err(SiggError::runtime("sub expects 2 arguments"));
+    }
+    match (&args[0], &args[1]) {
+        (Value::Int(a), Value::Int(b)) => Ok(Value::Int(a - b)),
+        (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a - b)),
+        (Value::Number(a), Value::Number(b)) => Ok(Value::Number(a - b)),
+        
+        (Value::Tensor(a), Value::Tensor(b)) => {
+            let res = Tensor::sub_graph(a.clone(), b.clone());
+            Ok(Value::Tensor(res))
+        },
+        _ => Err(SiggError::runtime("Invalid types for sub")),
+    }
+}
+
+// 掛け算 (*)
+pub fn builtin_mul(args: Vec<Value>) -> Result<Value, SiggError> {
+    if args.len() != 2 {
+        return Err(SiggError::runtime("mul expects 2 arguments"));
+    }
+    match (&args[0], &args[1]) {
+        (Value::Int(a), Value::Int(b)) => Ok(Value::Int(a * b)),
+        (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a * b)),
+        (Value::Number(a), Value::Number(b)) => Ok(Value::Number(a * b)),
+
+        (Value::Tensor(a), Value::Tensor(b)) => {
+            let res = Tensor::mul_graph(a.clone(), b.clone());
+            Ok(Value::Tensor(res))
+        },
+        _ => Err(SiggError::runtime("Invalid types for mul")),
+    }
+}
+pub fn builtin_div(args: Vec<Value>) -> Result<Value, SiggError> {
+    if args.len() != 2 {
+        return Err(SiggError::runtime("div expects 2 arguments"));
+    }
+    match (&args[0], &args[1]) {
+        (Value::Int(a), Value::Int(b)) => {
+            if *b == 0 { return Err(SiggError::runtime("division by zero")); }
+            Ok(Value::Int(a / b))
+        },
+        (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a / b)),
+        (Value::Number(a), Value::Number(b)) => Ok(Value::Number(a / b)),
+
+        // Tensor / Tensor
+        (Value::Tensor(a), Value::Tensor(b)) => {
+            let res = Tensor::div_graph(a.clone(), b.clone());
+            Ok(Value::Tensor(res))
+        },
+        _ => Err(SiggError::runtime("Invalid types for div")),
+    }
+}
+// 単項マイナス (Neg)
+pub fn builtin_neg(args: Vec<Value>) -> Result<Value, SiggError> {
+    if args.len() != 1 {
+        return Err(SiggError::runtime("neg expects 1 argument"));
+    }
+    match &args[0] {
+        Value::Int(a) => Ok(Value::Int(-a)),
+        Value::Float(a) => Ok(Value::Float(-a)),
+        Value::Number(a) => Ok(Value::Number(-a)),
+        
+        // ★修正: 0-t ではなく、専用の neg_graph を呼ぶ
+        Value::Tensor(t) => {
+            let res = Tensor::neg_graph(t.clone());
+            Ok(Value::Tensor(res))
+        }
+        _ => Err(SiggError::runtime("Invalid type for neg")),
+    }
+}
+// 剰余 (%)
+pub fn builtin_mod(args: Vec<Value>) -> Result<Value, SiggError> {
+    if args.len() != 2 {
+        return Err(SiggError::runtime("mod expects 2 arguments"));
+    }
+    match (&args[0], &args[1]) {
+        (Value::Int(a), Value::Int(b)) => {
+            if *b == 0 { return Err(SiggError::runtime("modulo by zero")); }
+            Ok(Value::Int(a % b))
+        },
+        (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a % b)),
+        (Value::Number(a), Value::Number(b)) => Ok(Value::Number(a % b)),
+        
+        // ★追加: TensorのMod対応 (高速化のため微分は切断)
+        (Value::Tensor(a), Value::Tensor(b)) => {
+            let res = Tensor::rem_graph(a.clone(), b.clone());
+            Ok(Value::Tensor(res))
+        },
+        
+        _ => Err(SiggError::runtime("Invalid types for mod")),
+    }
+}
+// 1. builtin_exp 関数を追加
+pub fn builtin_exp(args: Vec<Value>) -> Result<Value, SiggError> {
+    if args.len() != 1 {
+        return Err(SiggError::runtime("exp expects 1 argument"));
+    }
+    match &args[0] {
+        Value::Int(a) => Ok(Value::Float((*a as f64).exp())),
+        Value::Float(a) => Ok(Value::Float(a.exp())),
+        Value::Number(a) => Ok(Value::Float(a.exp())), // Number(f64)の場合
+        Value::Tensor(t) => {
+            let res = Tensor::exp_graph(t.clone());
+            Ok(Value::Tensor(res))
+        },
+        _ => Err(SiggError::runtime("Invalid type for exp")),
+    }
+}
+pub fn builtin_zero_grad(args: Vec<Value>) -> Result<Value, SiggError> {
+    if args.len() != 1 {
+        return Err(SiggError::runtime("zero_grad expects 1 argument"));
+    }
+    match &args[0] {
+        Value::Tensor(t) => {
+            let mut tensor = t.write().unwrap();
+            // 勾配を None に戻す（リセット）
+            tensor.grad = None; 
+            Ok(Value::Int(0)) // ダミーの戻り値
+        },
+        _ => Err(SiggError::runtime("zero_grad expects a tensor")),
+    }
+}
+
+
 //new　↓
 
 // ==============================
@@ -362,64 +510,77 @@ fn load_program_into_space(space: &mut ComputeSpace, prog: &[u32]) {
     }
 }
 // ---------- basic builtins ----------
-fn builtin_print(args: Vec<Value>) -> Result<Value, SiggError> {
+// 値をきれいな文字列に変換するヘルパー関数
+fn value_to_string(v: &Value) -> String {
+    match v {
+        Value::Int(i) => i.to_string(),
+        Value::Number(n) => n.to_string(),
+        Value::Float(f) => f.to_string(),
+        // Value::F32(f) => f.to_string(), // 必要ならコメントアウト解除
+        Value::Str(s) => s.clone(),
+        Value::Bool(b) => b.to_string(),
+        Value::Vec(v) | Value::List(v) => format!("{:?}", v), // リストはデバッグ表示
+        _ => format!("{:?}", v), // その他はデバッグ表示
+    }
+}
+pub fn builtin_print(args: Vec<Value>) -> Result<Value, SiggError> {
     if args.is_empty() {
         println!();
-        return Ok(Value::Unit);
+        return Ok(Value::Int(0));
     }
-    let (level, rest) = if let Some(Value::Str(s)) = args.first() {
-        if matches!(s.as_str(), "debug" | "info" | "warn" | "error") {
-            (Some(s.as_str()), &args[1..])
-        } else {
-            (None, &args[..])
-        }
-    } else {
-        (None, &args[..])
-    };
-    let print_fn = match level {
-        Some("debug") => |s: &str| eprintln!("[DEBUG] {}", s),
-        Some("info") => |s: &str| println!("[INFO] {}", s),
-        Some("warn") => |s: &str| eprintln!("[WARN] {}", s),
-        Some("error") => |s: &str| eprintln!("[ERROR] {}", s),
-        _ => |s: &str| println!("{}", s),
-    };
-    if let Some(Value::Str(fmt)) = rest.first() {
-        // フォーマット文字列として扱う
-        let mut output = String::new();
-        let mut arg_iter = rest.iter().skip(1);
-        let mut chars = fmt.chars().peekable();
-        while let Some(ch) = chars.next() {
-            if ch == '{' && chars.peek() == Some(&'}') {
-                chars.next();
-                if let Some(arg) = arg_iter.next() {
-                    output.push_str(&format!("{}", arg));
-                } else {
-                    return Err(SiggError::runtime("not enough arguments for format"));
-                }
-            } else {
-                output.push(ch);
+
+    // 第1引数が文字列で、かつ "{}" を含んでいるかチェック
+    let first_arg = &args[0];
+    if let Value::Str(fmt_str) = first_arg {
+        if fmt_str.contains("{}") {
+            // --- フォーマット出力モード ---
+            let mut output = fmt_str.clone();
+            
+            // args[1] 以降の引数を順番に埋め込む
+            for i in 1..args.len() {
+                let val_str = value_to_string(&args[i]);
+                // 文字列中の最初の "{}" を値に置き換える
+                output = output.replacen("{}", &val_str, 1);
             }
-        }
-        if arg_iter.next().is_some() {
-            return Err(SiggError::runtime("too many arguments for format"));
-        }
-        print_fn(&output);
-    } else {
-        // スペース区切り
-        let mut output = String::new();
-        for (i, arg) in rest.iter().enumerate() {
-            if i > 0 { output.push(' '); }
-            output.push_str(&format!("{}", arg));
-        }
-        print_fn(&output);
-    }
-    for arg in &args {
-        if let Value::Grid(g) = arg {
-            let d = digest_grid_u32(g.as_ref());
-            LAST_DIGEST.store(d as u64, Ordering::Relaxed);
+            
+            println!("{}", output);
+            return Ok(Value::Int(0));
         }
     }
-    Ok(Value::Unit)
+
+    // --- 従来モード (引数をスペース区切りで表示) ---
+    // 例: print(a, b) -> "10 20"
+    let mut output = String::new();
+    for (i, arg) in args.iter().enumerate() {
+        if i > 0 {
+            output.push(' ');
+        }
+        output.push_str(&value_to_string(arg));
+    }
+    println!("{}", output);
+
+    Ok(Value::Int(0))
+}
+fn format_value(v: &Value) -> String {
+    match v {
+        Value::Unit => "()".to_string(),
+        Value::Bool(b) => b.to_string(),
+        Value::Int(n) => n.to_string(),
+        Value::Float(n) => n.to_string(),
+        Value::Number(n) => n.to_string(),
+        Value::Str(s) => s.clone(), 
+
+        // ★修正箇所: .read() を削除して直接 items.iter() を使います
+        Value::List(items) => {
+            let parts: Vec<String> = items.iter().map(|v| format_value(v)).collect();
+            format!("[{}]", parts.join(", "))
+        }
+
+        Value::Tensor(_) => "<Tensor>".to_string(),//"".to_string(),
+        
+        // 関数やNativeFunctionなど
+        _ => "<Value>".to_string(),//"".to_string(),
+    }
 }
 
 fn builtin_vec_get(args: Vec<Value>) -> Result<Value, SiggError> {
@@ -954,6 +1115,8 @@ fn builtin_namespace_create(args: Vec<Value>) -> Result<Value, SiggError> {
 
 fn as_f64(v: &Value) -> Result<f64, SiggError> {
     match v {
+        Value::Int(n) => Ok(*n as f64),
+        Value::Float(f) => Ok(*f),
         Value::Number(n) => Ok(*n),
         Value::F32(x) => Ok(*x as f64),
         _ => Err(SiggError::runtime("expected number")),
@@ -2227,121 +2390,167 @@ fn as_float_vec(v: &Value) -> Result<Vec<f32>, SiggError> {
 
 
 
-pub fn builtin_tensor_new(args: Vec<Value>) -> EvalResult {
+// src/builtins.rs の builtin_tensor_new 関数全体を書き換え
+
+// src/builtins.rs の builtin_tensor_new 関数全体を書き換え
+
+fn builtin_tensor_new(args: Vec<Value>) -> Result<Value, SiggError> {
     if args.len() != 1 {
-        return Err(runtime_err("tensor() takes exactly 1 argument (shape)"));
+        return Err(SiggError::runtime("tensor expects 1 argument (shape list)"));
     }
 
-    let shape: Vec<usize> = match &args[0] {
-        Value::List(list) => {
-            let mut dims = Vec::new();
-            for v in list {
-                match v {
-                    Value::Int(n) => {
-                        if *n < 0 { return Err(runtime_err("Shape dimensions must be positive")); }
-                        dims.push(*n as usize);
-                    },
-                    _ => return Err(runtime_err("Shape must be a list of integers")),
+    let shape_val = &args[0];
+    let mut shape = Vec::new();
+
+    // 1. リストからシェイプを取り出す
+    match shape_val {
+        Value::List(items) => {
+            // ★修正1: .read().unwrap() を削除。items は &Vec<Value> なのでそのまま回せます。
+            for item in items.iter() {
+                // println!("DEBUG: tensor item check: {:?}", item);
+                match item {
+                    // ★修正2: Value::Int(n) の n は &i64 なので *n で実体化します
+                    Value::Int(n) => shape.push(*n as usize),
+                    // Floatの場合も許容して usize に変換
+                    Value::Float(f) => shape.push(*f as usize),
+                    Value::Number(n) => shape.push(*n as usize),
+                    _ => return Err(SiggError::runtime("Shape must be a list of integers")),
                 }
             }
-            dims
-        },
-        _ => return Err(runtime_err("Argument must be a list representing shape")),
-    };
-
-    if shape.is_empty() {
-        return Err(runtime_err("Shape cannot be empty"));
+        }
+        _ => return Err(SiggError::runtime("tensor argument must be a list")),
     }
+
+    // 2. テンソルを作成して返す
+    // ★修正3: ここで Value::Tensor を作成して返す必要があります
+    // (Tensor構造体の場所は crate::pocket::tensor::Tensor だと仮定しています)
+    use crate::pocket::tensor::Tensor;
+    use std::sync::{Arc, RwLock};
 
     let t = Tensor::zeros(shape);
-    // ★ Arc::new(RwLock::new(...)) に変更
     Ok(Value::Tensor(Arc::new(RwLock::new(t))))
 }
-
-pub fn builtin_tensor_laplacian(args: Vec<Value>) -> EvalResult {
+pub fn builtin_tensor_laplacian(args: Vec<Value>) -> Result<Value, SiggError> {
     if args.len() != 1 {
-        return Err(runtime_err("laplacian() takes exactly 1 argument"));
+        return Err(SiggError::runtime("laplacian expects 1 argument"));
     }
-
     match &args[0] {
-        Value::Tensor(t_rc) => {
-            // ★ .borrow() を .read().map_err(...) に変更
-            let t_lock = t_rc.read().map_err(|_| runtime_err("Failed to acquire read lock on tensor"))?;
-            let result_tensor = t_lock.discrete_laplacian();
-            
-            // 新しいTensorを返す
-            Ok(Value::Tensor(Arc::new(RwLock::new(result_tensor))))
+        Value::Tensor(t) => {
+            // ★修正: 計算グラフ対応版を呼ぶ
+            let res = Tensor::laplacian_graph(t.clone());
+            Ok(Value::Tensor(res))
         },
-        _ => Err(runtime_err("Argument must be a Tensor")),
+        _ => Err(SiggError::runtime("laplacian expects a tensor")),
     }
 }
-
-pub fn builtin_tensor_get(args: Vec<Value>) -> EvalResult {
+pub fn builtin_tensor_get(args: Vec<Value>) -> Result<Value, SiggError> {
     if args.len() != 2 {
-        return Err(runtime_err("t_get() takes 2 arguments: (tensor, coords)"));
+        return Err(SiggError::runtime("t_get expects 2 arguments"));
     }
-
-    let t_rc = match &args[0] {
-        Value::Tensor(t) => t,
-        _ => return Err(runtime_err("First argument must be a Tensor")),
+    
+    // Tensor取得
+    let tensor_arc = match &args[0] {
+        Value::Tensor(t) => t.clone(),
+        _ => return Err(SiggError::runtime("First argument must be a tensor")),
     };
+    let tensor = tensor_arc.read().unwrap();
 
-    let coords: Vec<usize> = match &args[1] {
-        Value::List(list) => {
-            list.iter().map(|v| match v {
-                Value::Int(n) => *n as usize,
-                _ => 0, 
-            }).collect()
+    // インデックス取得
+    let indices: Vec<usize> = match &args[1] {
+        Value::Vec(v) | Value::List(v) => { // ListもVecも許可
+            let mut idxs = Vec::new();
+            for val in v.iter() {
+                match val {
+                    Value::Int(i) => idxs.push(*i as usize), 
+                    Value::Number(n) => idxs.push(*n as usize),
+                    Value::Float(f) => idxs.push(*f as usize),
+                    _ => return Err(SiggError::runtime("Indices must be numbers")),
+                }
+            }
+            idxs
         },
-        _ => return Err(runtime_err("Second argument must be a coordinate list")),
+        Value::Tensor(t_idx) => {
+            let t = t_idx.read().unwrap();
+            t.data.iter().map(|c| c.re as usize).collect()
+        },
+        Value::Int(i) => vec![*i as usize],
+        Value::Number(n) => vec![*n as usize],
+        Value::Float(f) => vec![*f as usize],
+        _ => return Err(SiggError::runtime("Invalid index type")),
     };
 
-    // ★ .borrow() を .read() に変更
-    let t_lock = t_rc.read().map_err(|_| runtime_err("Failed to acquire read lock"))?;
-    let val = t_lock.get(&coords);
-
-    Ok(Value::List(vec![
-        Value::Float(val.re),
-        Value::Float(val.im)
-    ]))
+    let c = tensor.get(&indices);
+    // 数値として返す
+    Ok(Value::Number(c.re))
 }
-
-pub fn builtin_tensor_set(args: Vec<Value>) -> EvalResult {
+pub fn builtin_tensor_set(args: Vec<Value>) -> Result<Value, SiggError> {
     if args.len() != 3 {
-        return Err(runtime_err("t_set() takes 3 arguments: (tensor, coords, [re, im])"));
+        return Err(SiggError::runtime("t_set expects 3 arguments: (tensor, indices, value)"));
     }
 
-    let t_rc = match &args[0] {
-        Value::Tensor(t) => t,
-        _ => return Err(runtime_err("First argument must be a Tensor")),
+    // 1. Tensor取得
+    let tensor_arc = match &args[0] {
+        Value::Tensor(t) => t.clone(),
+        _ => return Err(SiggError::runtime("First argument must be a tensor")),
     };
 
-    let coords: Vec<usize> = match &args[1] {
-        Value::List(list) => {
-            list.iter().map(|v| match v {
-                Value::Int(n) => *n as usize,
-                _ => 0, 
-            }).collect()
+    // 2. インデックス取得
+    let indices: Vec<usize> = match &args[1] {
+        // リスト系
+        Value::Vec(v) | Value::List(v) => {
+            let mut idxs = Vec::new();
+            for val in v.iter() {
+                match val {
+                    Value::Int(i) => idxs.push(*i as usize), 
+                    Value::Number(n) => idxs.push(*n as usize),
+                    Value::Float(f) => idxs.push(*f as usize),
+                    _ => return Err(SiggError::runtime("Indices must be numbers")),
+                }
+            }
+            idxs
         },
-        _ => return Err(runtime_err("Second argument must be a coordinate list")),
-    };
-
-    let complex_val = match &args[2] {
-        Value::List(v) if v.len() == 2 => {
-            let re = match &v[0] { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => 0.0 };
-            let im = match &v[1] { Value::Float(f) => *f, Value::Int(i) => *i as f64, _ => 0.0 };
-            Complex::new(re, im)
+        // 数値単体
+        Value::Int(i) => vec![*i as usize],
+        Value::Number(n) => vec![*n as usize],
+        Value::Float(f) => vec![*f as usize],
+        
+        // Tensor型
+        Value::Tensor(t_idx) => {
+            let t = t_idx.read().unwrap();
+            t.data.iter().map(|c| c.re as usize).collect()
         },
-        Value::Float(f) => Complex::new(*f, 0.0),
-        Value::Int(i) => Complex::new(*i as f64, 0.0),
-        _ => return Err(runtime_err("Third argument must be [re, im] or a number")),
+        
+        _ => return Err(SiggError::runtime("Second argument must be a list of indices or a number")),
     };
 
-    // ★ .borrow_mut() を .write() に変更
-    let mut t_lock = t_rc.write().map_err(|_| runtime_err("Failed to acquire write lock"))?;
-    t_lock.set(&coords, complex_val);
+    // 3. 値の変換 (修正ポイント: Complex を直接使用)
+    let new_val = match &args[2] {
+        // [re, im]
+        Value::Vec(v) | Value::List(v) => {
+            if v.len() != 2 {
+                return Err(SiggError::runtime("Value must be [re, im]"));
+            }
+            let re = match v[0] { Value::Int(i)=>i as f64, Value::Number(n)=>n, Value::Float(f)=>f, _=>0.0 };
+            let im = match v[1] { Value::Int(i)=>i as f64, Value::Number(n)=>n, Value::Float(f)=>f, _=>0.0 };
+            
+            // ★修正: crate::tensor::Complex ではなく Complex だけでOK
+            Complex { re, im }
+        },
+        // 数値単体
+        Value::Int(i) => Complex { re: *i as f64, im: 0.0 },
+        Value::Number(n) => Complex { re: *n, im: 0.0 },
+        Value::Float(f) => Complex { re: *f, im: 0.0 },
+        
+        _ => return Err(SiggError::runtime("Third argument must be [re, im] or a number")),
+    };
 
-    Ok(Value::List(vec![])) 
+    // 4. 書き込み
+    {
+        let mut t = tensor_arc.write().unwrap();
+        t.set(&indices, new_val);
+    }
+
+    Ok(Value::Int(0))
 }
 
 pub fn builtin_list(args: Vec<Value>) -> EvalResult {
@@ -2363,9 +2572,143 @@ fn builtin_grid_stats(args: Vec<Value>) -> Result<Value, SiggError> {
         Value::F32(std),
     ]))
 }
+
+// 勾配計算を開始する
+fn builtin_backward(args: Vec<Value>) -> Result<Value, SiggError> {
+    if args.len() != 1 {
+        return Err(SiggError::runtime("backward expects 1 argument"));
+    }
+    match &args[0] {
+        Value::Tensor(t) => {
+            let mut tensor = t.write().map_err(|e| SiggError::runtime(e.to_string()))?;
+            tensor.backward();
+            Ok(Value::Unit)
+        }
+        _ => Err(SiggError::runtime("backward expects a tensor")),
+    }
+}
+fn builtin_grad(args: Vec<Value>) -> Result<Value, SiggError> {
+    if args.len() != 1 {
+        return Err(SiggError::runtime("grad expects 1 argument"));
+    }
+    match &args[0] {
+        Value::Tensor(t) => {
+            let tensor = t.read().map_err(|e| SiggError::runtime(e.to_string()))?;
+            if let Some(g) = &tensor.grad {
+                let grad_tensor = Tensor {
+                    data: g.clone(),
+                    shape: tensor.shape.clone(),
+                    grad: None,
+                    requires_grad: false,
+                    op: crate::pocket::tensor::OpType::Leaf,
+                    parents: vec![],
+                };
+                Ok(Value::Tensor(Arc::new(RwLock::new(grad_tensor))))
+            } else {
+                let zero = Tensor::zeros(tensor.shape.clone());
+                Ok(Value::Tensor(Arc::new(RwLock::new(zero))))
+            }
+        }
+        _ => Err(SiggError::runtime("grad expects a tensor")),
+    }
+}
+fn builtin_enable_grad(args: Vec<Value>) -> Result<Value, SiggError> {
+    if args.len() != 1 {
+        return Err(SiggError::runtime("enable_grad expects 1 argument"));
+    }
+    match &args[0] {
+        Value::Tensor(t) => {
+            let mut tensor = t.write().map_err(|e| SiggError::runtime(e.to_string()))?;
+            tensor.requires_grad = true;
+            Ok(args[0].clone())
+        }
+        _ => Err(SiggError::runtime("enable_grad expects a tensor")),
+    }
+}
+/// SIGG呼び出し: t_set_2d(world, x, y, [real, imag])
+pub fn t_set_2d(args: Vec<Value>) -> Result<Value, SiggError> {
+    if args.len() < 4 { return Err(SiggError::runtime("4 args required")); }
+
+    let arc_tensor = match &args[0] {
+        Value::Tensor(t) => t,
+        _ => return Err(SiggError::runtime("Arg 0 must be a Tensor")),
+    };
+
+    // ヘルパー関数を使用して数値を取得
+    let x = as_f64(&args[1])? as usize;
+    let y = as_f64(&args[2])? as usize;
+
+    let (re, im) = match &args[3] {
+        Value::List(l) => {
+            let r = as_f64(&l[0])?;
+            let i = if l.len() > 1 { as_f64(&l[1])? } else { 0.0 };
+            (r, i)
+        },
+        _ => return Err(SiggError::runtime("Arg 3 must be a list")),
+    };
+
+    // ...以下、テンソルへの書き込み処理（前回と同じ）...
+    let mut tensor = arc_tensor.write().unwrap();
+    let idx = y * tensor.shape[0] + x;
+    tensor.data[idx] = Complex::new(re, im);
+    Ok(Value::Number(0.0))
+}
+/// 2次元ラプラシアン（拡散）を計算する
+/// SIGG呼び出し: let diff = laplacian_2d(world);
+pub fn laplacian_2d(args: Vec<Value>) -> Result<Value, SiggError> {
+    if args.is_empty() {
+        return Err(SiggError::runtime("laplacian_2d requires a tensor"));
+    }
+
+    let arc_tensor = match &args[0] {
+        Value::Tensor(t) => t,
+        _ => return Err(SiggError::runtime("Arg must be a Tensor")),
+    };
+
+    let tensor = arc_tensor.read().unwrap();
+    let w = tensor.shape[0];
+    let h = if tensor.shape.len() > 1 { tensor.shape[1] } else { 1 };
+
+    if w < 3 || h < 3 {
+        return Err(SiggError::runtime("Tensor too small for 2D Laplacian"));
+    }
+
+    let mut new_data = vec![Complex::new(0.0, 0.0); w * h];
+
+    // 5点差分法によるラプラス演算
+    for y in 1..h - 1 {
+        for x in 1..w - 1 {
+            let idx = y * w + x;
+            let center = tensor.data[idx];
+            let left   = tensor.data[idx - 1];
+            let right  = tensor.data[idx + 1];
+            let up     = tensor.data[idx - w];
+            let down   = tensor.data[idx + w];
+
+            // Δf = f(x+1) + f(x-1) + f(y+1) + f(y-1) - 4f(x,y)
+            let lap = Complex::new(
+                right.re + left.re + up.re + down.re - 4.0 * center.re,
+                right.im + left.im + up.im + down.im - 4.0 * center.im,
+            );
+            new_data[idx] = lap;
+        }
+    }
+
+    let mut out_tensor = Tensor::zeros(vec![w, h]);
+    out_tensor.data = new_data;
+    Ok(Value::Tensor(Arc::new(RwLock::new(out_tensor))))
+}
+pub fn visualize_placeholder(_args: Vec<Value>) -> Result<Value, SiggError> {
+    // 中身は空でOK。実行時は vm.rs 側で上書き（フック）されます。
+    Ok(Value::Unit)
+}
+
 pub fn builtins() -> Vec<Builtin> {
-    println!("DEBUG: Loading builtins..."); // ★ これを追加
+    //println!("DEBUG: Loading builtins..."); // ★ これを追加
     vec![
+        // Builtin { name: "", f: },
+        Builtin { name: "exp", f: builtin_exp },
+        Builtin { name: "zero_grad", f: builtin_zero_grad },
         Builtin { name: "print", f: builtin_print },
         Builtin { name: "vec_get", f: builtin_vec_get },
         Builtin { name: "vec_set", f: builtin_vec_set },
@@ -2450,11 +2793,18 @@ pub fn builtins() -> Vec<Builtin> {
         Builtin { name: "str_to_upper", f: builtin_str_to_upper },
         Builtin { name: "str_to_lower", f: builtin_str_to_lower },
         Builtin { name: "str_len", f: builtin_str_len },
+
         Builtin { name: "tensor", f: builtin_tensor_new },
         Builtin { name: "laplacian", f: builtin_tensor_laplacian },
         Builtin { name: "t_get", f: builtin_tensor_get },
         Builtin { name: "t_set", f: builtin_tensor_set },
         Builtin { name: "list", f: builtin_list },
+        Builtin { name: "backward", f: builtin_backward },
+        Builtin { name: "grad", f: builtin_grad },
+        Builtin { name: "enable_grad", f: builtin_enable_grad },
+        Builtin { name: "t_set_2d", f: t_set_2d },
+        Builtin { name: "laplacian_2d", f: laplacian_2d },
+        Builtin { name: "visualize", f: visualize_placeholder },
         //Builtin { name: "", f: },
     ]
 }

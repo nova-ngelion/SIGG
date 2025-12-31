@@ -19,18 +19,26 @@ pub fn main() -> Result<(), SiggError> {
             let src = std::fs::read_to_string(path)
                 .map_err(|e| SiggError::io(e.to_string()))?;
 
+            // 1. パース (Source -> AST)
             let mut ps = SiggParser::new(&src);
-            let prog = ps.parse_program()?;
+            let ast_prog = ps.parse_program()?;
 
+            // 2. コンパイル (AST -> Bytecode)
+            let compiled = crate::bytecode::compile(&ast_prog)?;
+
+            // 3. VMの準備と実行
             let mut vm = VM::new();
-            let compiled = bytecode::compile(&prog)?;
-            vm.exec_compiled(&compiled)?;
+            // VM::new() 内の HostFunction 登録で Arc::new(*f) を使う修正を vm.rs で忘れないでください
+            
+            if let Err(e) = vm.exec_compiled(&compiled) {
+                println!("Execution error: {:?}", e);
+                return Err(e);
+            }
             Ok(())
         }
 
         "serve" => {
-            // sigg serve --addr 127.0.0.1:39999
-            let mut addr = "127.0.0.1:39999".to_string();
+            let mut addr = "127.0.0.1:9001".to_string();
             let mut i = 2;
             while i < args.len() {
                 if args[i] == "--addr" && i + 1 < args.len() {
@@ -40,6 +48,7 @@ pub fn main() -> Result<(), SiggError> {
                     i += 1;
                 }
             }
+            // 実際の通信処理は server.rs の中で行われます
             crate::server::serve(&addr)
         }
 

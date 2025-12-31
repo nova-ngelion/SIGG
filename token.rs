@@ -18,7 +18,7 @@ pub enum Tok {
     As,     // as
     Event, // event
     When,  // when
-
+    
     // identifiers / literals
     Ident(String),
     Number(f64),

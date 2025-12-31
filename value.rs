@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use crate::bytecode::FnId;
 use std::sync::{Arc, RwLock};
 use crate::pocket::tensor::Tensor;
+use crate::error::SiggError;
 
 #[derive(Clone, Copy, Debug)]
 pub enum Boundary {
@@ -94,6 +95,7 @@ pub enum Value {
     Lambda(FnId),
     List(Vec<Value>),
     Tensor(Arc<RwLock<Tensor>>),
+    NativeFunction(fn(Vec<Value>) -> Result<Value, SiggError>),
     Closure {
         fn_id: FnId,
         upvalues: Vec<Value>,
@@ -146,6 +148,19 @@ pub enum Value {
     },
 }
 
+// src/value.rs の末尾などに追加
+impl Value {
+    pub fn as_f64(&self) -> Result<f64, SiggError> {
+        match self {
+            Value::Int(n) => Ok(*n as f64),
+            Value::Float(f) => Ok(*f),
+            Value::Number(n) => Ok(*n),
+            Value::F32(x) => Ok(*x as f64),
+            _ => Err(SiggError::runtime("expected number")),
+        }
+    }
+}
+
 // PartialEqの手動実装 (浮動小数点やTensorが含まれるため厳密な比較は難しいが、簡易的に実装)
 impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
@@ -158,6 +173,10 @@ impl PartialEq for Value {
             // Tensor同士の比較はポインタの一致、または中身の比較が必要
             // ここでは簡易的に「同じArcを指しているか」で判定するか、常にfalseにする
             (Value::Tensor(a), Value::Tensor(b)) => Arc::ptr_eq(a, b),
+            (Value::NativeFunction(f1), Value::NativeFunction(f2)) => {
+                // エラーログに合わせて参照外し(*)を削除しました
+                (*f1 as usize) == (*f2 as usize)
+            },
             _ => false,
         }
     }
@@ -257,7 +276,7 @@ impl std::fmt::Debug for Value {
                     write!(f, "{}", v)?;
                 }
                 write!(f, "]")
-            },
+            }
             Value::Tensor(t) => {
                 // RwLockの読み取りロックを取得
                 if let Ok(guard) = t.read() {
@@ -265,7 +284,8 @@ impl std::fmt::Debug for Value {
                 } else {
                     write!(f, "<Tensor (locked)>")
                 }
-            },
+            }
+            Value::NativeFunction(_) => write!(f, "<native fn>"),
         }
     }
 }
@@ -365,6 +385,7 @@ impl std::fmt::Display for Value {
                     write!(f, "<Tensor (locked)>")
                 }
             },
+            Value::NativeFunction(_) => write!(f, "<native fn>"),
             _ => write!(f, "<Value>"),
         }
     }
