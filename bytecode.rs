@@ -23,6 +23,7 @@ pub enum Op {
     Div,
     Mod, // %
     BitAnd, // &
+    Not,
     Eq, // 新しい演算子: ==
     Ne, // 新しい演算子: !=
     Lt, // 新しい演算子: <
@@ -118,21 +119,24 @@ impl FnTable {
         id
     }
     pub fn name(&self, id: FnId) -> &str { &self.id_to_name[id.0 as usize] }
+    pub fn default() -> Self {
+        Self::new()
+    }
 }
 
-struct FnCompiler<'a> {
-    locals: HashMap<String, u16>,
-    chunk: Chunk,
-    table: &'a mut FnTable,
-    next_repeat_slot: u16,
-    lambda_fns: Vec<(FnId, Chunk, Span)>,
+pub struct FnCompiler<'a> {
+    pub locals: HashMap<String, u16>,
+    pub chunk: Chunk,
+    pub table: &'a mut FnTable,
+    pub next_repeat_slot: u16,
+    pub lambda_fns: Vec<(FnId, Chunk, Span)>,
 }
 
 impl<'a> FnCompiler<'a> {
-    fn new(table: &'a mut FnTable) -> Self {
+    pub fn new(table: &'a mut FnTable) -> Self {
         Self { locals: HashMap::new(), chunk: Chunk::new(), table, next_repeat_slot: 0, lambda_fns: vec![] }
     }
-    fn resolve_local(&self, name: &str) -> Option<u16> {
+    pub fn resolve_local(&self, name: &str) -> Option<u16> {
         self.locals.get(name).copied()
     }
 
@@ -184,7 +188,7 @@ impl<'a> FnCompiler<'a> {
         }
     }
 
-    fn compile_stmt(&mut self, s: &Stmt) -> Result<(), SiggError> {
+    pub fn compile_stmt(&mut self, s: &Stmt) -> Result<(), SiggError> {
         match s {
             // ★ 修正: type_ann フィールドを追加
             Stmt::Let { pat, type_ann, expr } => {
@@ -433,8 +437,7 @@ impl<'a> FnCompiler<'a> {
                 match op {
                     UnOp::Neg => self.chunk.emit(Op::Neg),
                     UnOp::Not => {
-                        // TODO: Op::Not を実装
-                        return Err(SiggError::runtime("Not operator not yet implemented"));
+                        self.chunk.emit(Op::Not);
                     }
                 }
                 Ok(()) // ★ 追加

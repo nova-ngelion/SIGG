@@ -796,4 +796,13 @@ impl<'a> Parser<'a> {
         self.expect(Tok::RBrace)?;
         Ok(body)
     }
+
+    pub fn parse_script(&mut self) -> Result<Vec<Stmt>, SiggError> {
+        let mut stmts = Vec::new();
+        // EOF（ファイルの終わり）まで文を読み続ける
+        while self.cur.is_some() {
+            stmts.push(self.parse_stmt()?);
+        }
+        Ok(stmts)
+    }
 }

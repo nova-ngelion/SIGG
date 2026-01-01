@@ -10,6 +10,7 @@ use crate::error::SiggError;
 use crate::value::{Grid, GridRef, Value};
 use std::net::TcpStream;
 use std::io::Write;
+use crate::parser::Parser;
 
 type BuiltinFn = fn(Vec<Value>) -> Result<Value, SiggError>;
 
@@ -109,6 +110,29 @@ impl VM {
             m.insert(b.name.to_string(), b.f);
             g.insert(b.name.to_string(), Value::NativeFunction(b.f));
         }
+
+        // 1. sin
+        m.insert("sin".to_string(), builtins::std_sin);
+        g.insert("sin".to_string(), Value::NativeFunction(builtins::std_sin));
+
+        // 2. cos
+        m.insert("cos".to_string(), builtins::std_cos);
+        g.insert("cos".to_string(), Value::NativeFunction(builtins::std_cos));
+
+        // 3. tan
+        m.insert("tan".to_string(), builtins::std_tan);
+        g.insert("tan".to_string(), Value::NativeFunction(builtins::std_tan));
+
+        // 4. sqrt
+        m.insert("sqrt".to_string(), builtins::std_sqrt);
+        g.insert("sqrt".to_string(), Value::NativeFunction(builtins::std_sqrt));
+
+        // 5. fmt (フォーマット)
+        m.insert("fmt".to_string(), builtins::std_fmt);
+        g.insert("fmt".to_string(), Value::NativeFunction(builtins::std_fmt));
+
+        // 6. visualize (ダミー登録のままでOKですが、もし関数化するなら同様に変更)
+        g.insert("visualize".to_string(), Value::Number(0.0));
 
         // --- ここを追加 ---
         // visualize という名前だけ globals に登録しておく（コンパイラに見つけさせるため）
@@ -270,7 +294,17 @@ impl VM {
                         //println!("DEBUG: VM is calling visualize function!!!"); // これを追加
                         let arg = args[0].clone();
                         return self.send_visualize_data(arg);
-                    }                  
+                    }
+                    "eval" => {
+                        if args.len() != 1 {
+                            return Err(SiggError::runtime("eval expects 1 argument (code string)"));
+                        }
+                        let source = match &args[0] {
+                            Value::Str(s) => s.clone(),
+                            _ => return Err(SiggError::runtime("eval expects a string")),
+                        };
+                        return self.run_eval(source);
+                    }
                     _ => {} // 次へ進む
                 }
             
@@ -370,7 +404,6 @@ impl VM {
         
         Ok(acc)
     }
-
     pub fn exec_compiled(&mut self, prog: &CompiledProgram) -> Result<(), SiggError> {
         //println!("DEBUG: exec_compiled started"); // ★ログ
         let mut stack: Vec<Value> = Vec::new();
@@ -528,6 +561,20 @@ impl VM {
                     let a = stack.pop().ok_or(SiggError::runtime("Stack underflow"))?;
                     let res = crate::builtins::builtin_neg(vec![a])?;
                     stack.push(res);
+                }
+                Op::Not => {
+                    let val = stack.pop().ok_or(SiggError::runtime("Stack underflow"))?;
+                    
+                    // 真偽判定ロジック
+                    let is_truthy = match val {
+                        Value::Bool(b) => b,
+                        Value::Unit => false,   // () も false 扱いにする場合
+                        Value::Number(n) => n != 0.0, // (オプション) 0.0 も false 扱いにするなら
+                        _ => true,              // それ以外は全部 true
+                    };
+    
+                    // 結果を反転してプッシュ
+                    stack.push(Value::Bool(!is_truthy));
                 }
                 // src/vm.rs の Op::Visualize 処理
                 // match op { ... } の中
@@ -853,6 +900,192 @@ impl VM {
             }
         }
 
+        Ok(())
+    }
+    pub fn run_eval(&mut self, source: String) -> Result<Value, SiggError> {
+        // 1. パース: parse_script を使って Vec<Stmt> を取得
+        let mut parser = Parser::new(&source);
+        let ast = parser.parse_script()
+            .map_err(|e| SiggError::runtime(format!("Parser error: {:?}", e)))?;
+
+        // 2. コンパイル
+        let mut fn_table = crate::bytecode::FnTable::default(); // これで通るようになります
+        let mut compiler = crate::bytecode::FnCompiler::new(&mut fn_table);
+        
+        // ast は Vec<Stmt> なので for で回せます
+        for stmt in ast {
+            compiler.compile_stmt(&stmt)
+                .map_err(|e| SiggError::runtime(format!("Compile error: {:?}", e)))?;
+        }
+        
+        // 念のため Return を追加
+        compiler.chunk.emit(crate::bytecode::Op::Return);
+
+        // コンパイル結果を取得（フィールドが pub になったのでアクセス可能）
+        let program = compiler.chunk;
+
+        // 3. 実行 (新しい VM を作成)
+        let mut sub_vm = VM::new();
+        sub_vm.builtins = self.builtins.clone();
+        sub_vm.globals = self.globals.clone();
+        sub_vm.seed = self.seed;
+        
+        if let Some(ref stream) = self.current_stream {
+             if let Ok(cloned) = stream.try_clone() {
+                 sub_vm.current_stream = Some(cloned);
+             }
+        }
+
+        // バイトコードを実行
+        match sub_vm.run(&program) {
+            Ok(_) => Ok(Value::Unit), // 最後に評価した値を返したい場合はスタック操作が必要ですが、一旦Unitで
+            Err(e) => Err(e),
+        }
+    }
+    pub fn run(&mut self, chunk: &crate::bytecode::Chunk) -> Result<(), SiggError> {
+        let mut stack: Vec<Value> = Vec::new();
+        let mut ip = 0; // インストラクション・ポインタ
+        let mut locals: Vec<Value> = vec![Value::Unit; chunk.local_count as usize];
+    
+        // 簡易的な実行ループ（exec_compiledの簡略版）
+        while ip < chunk.ops.len() {
+            let op = &chunk.ops[ip];
+            ip += 1;
+    
+            match op {
+                Op::Const(ci) => {
+                    let v = chunk
+                        .consts
+                        .get(*ci as usize)
+                        .cloned()
+                        .ok_or_else(|| SiggError::runtime("const index out of range"))?;
+                    stack.push(v);
+                }
+                Op::LoadLocal(i) => {
+                    let v = locals
+                        .get(*i as usize)
+                        .cloned()
+                        .ok_or_else(|| SiggError::runtime("local index out of range"))?;
+                    stack.push(v);
+                }
+                Op::StoreLocal(i) => {
+                    let v = stack.pop().ok_or_else(|| SiggError::runtime("stack underflow"))?;
+                    let idx = *i as usize;
+                    if idx >= locals.len() { 
+                        locals.resize(idx + 1, Value::Unit); 
+                    }
+                    locals[idx] = v;
+                }
+                Op::Pop => { 
+                    let _ = stack.pop(); 
+                }
+                Op::Add => {
+                    let rhs = stack.pop().ok_or(SiggError::runtime("Stack underflow"))?;
+                    let lhs = stack.pop().ok_or(SiggError::runtime("Stack underflow"))?;
+                    
+                    match (lhs, rhs) {
+                        (Value::Number(a), Value::Number(b)) => stack.push(Value::Number(a + b)),
+                        (Value::Tensor(t1_lock), Value::Tensor(t2_lock)) => {
+                            let mut t1 = t1_lock.write().unwrap();
+                            let t2 = t2_lock.read().unwrap();
+                            
+                            if t1.data.len() == t2.data.len() {
+                                for (v1, v2) in t1.data.iter_mut().zip(t2.data.iter()) {
+                                    v1.re += v2.re;
+                                    v1.im += v2.im;
+                                }
+                            }
+                            drop(t1);
+                            drop(t2);
+                            stack.push(Value::Tensor(t1_lock));
+                        }
+                        _ => return Err(SiggError::runtime("Invalid types for add")),
+                    }
+                }
+                Op::Sub => {
+                    let b = stack.pop().ok_or(SiggError::runtime("Stack underflow"))?;
+                    let a = stack.pop().ok_or(SiggError::runtime("Stack underflow"))?;
+                    let res = crate::builtins::builtin_sub(vec![a, b])?;
+                    stack.push(res);
+                }
+                Op::Mul => {
+                    let rhs = stack.pop().ok_or(SiggError::runtime("Stack underflow"))?;
+                    let lhs = stack.pop().ok_or(SiggError::runtime("Stack underflow"))?;
+                    
+                    match (lhs, rhs) {
+                        (Value::Number(a), Value::Number(b)) => stack.push(Value::Number(a * b)),
+                        (Value::Tensor(t_lock), Value::Number(n)) | (Value::Number(n), Value::Tensor(t_lock)) => {
+                            let mut t = t_lock.write().unwrap();
+                            let n_f64 = n as f64;
+                            
+                            for val in t.data.iter_mut() {
+                                val.re *= n_f64;
+                                val.im *= n_f64;
+                            }
+                            drop(t);
+                            stack.push(Value::Tensor(t_lock));
+                        }
+                        _ => return Err(SiggError::runtime("Invalid types for mul")),
+                    }
+                }
+                Op::Div => {
+                    let b = stack.pop().ok_or(SiggError::runtime("Stack underflow"))?;
+                    let a = stack.pop().ok_or(SiggError::runtime("Stack underflow"))?;
+                    let res = crate::builtins::builtin_div(vec![a, b])?;
+                    stack.push(res);
+                }
+                Op::Mod => {
+                    let b = stack.pop().ok_or(SiggError::runtime("Stack underflow"))?;
+                    let a = stack.pop().ok_or(SiggError::runtime("Stack underflow"))?;
+                    let res = crate::builtins::builtin_mod(vec![a, b])?;
+                    stack.push(res);
+                }
+                Op::Neg => {
+                    let a = stack.pop().ok_or(SiggError::runtime("Stack underflow"))?;
+                    let res = crate::builtins::builtin_neg(vec![a])?;
+                    stack.push(res);
+                }
+                Op::Not => {
+                    let val = stack.pop().ok_or(SiggError::runtime("Stack underflow"))?;
+                    
+                    let is_truthy = match val {
+                        Value::Bool(b) => b,
+                        Value::Unit => false,
+                        Value::Number(n) => n != 0.0,
+                        _ => true,
+                    };
+    
+                    stack.push(Value::Bool(!is_truthy));
+                }
+                Op::Visualize => {
+                    let arg = stack.pop().ok_or(SiggError::runtime("Stack underflow"))?;
+                    self.send_visualize_data(arg)?;
+                    stack.push(Value::Number(0.0));
+                    std::thread::sleep(std::time::Duration::from_millis(16));
+                }
+                Op::JumpIfFalse { off } => {
+                    let v = stack.pop().ok_or_else(|| SiggError::runtime("stack underflow"))?;
+                    if !is_truthy(&v) {
+                        ip = (ip as i32 + off) as usize;
+                    }
+                }
+                Op::Jump { off } => {
+                    ip = (ip as i32 + off) as usize;
+                }
+                Op::Return => {
+                    break;
+                }
+                
+                // 簡易実行では複雑な操作は未対応
+                _ => {
+                    return Err(SiggError::runtime(format!(
+                        "Operation {:?} not supported in simple run mode. Use exec_compiled instead.",
+                        op
+                    )));
+                }
+            }
+        }
+        
         Ok(())
     }
 }

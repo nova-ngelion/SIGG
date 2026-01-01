@@ -14,6 +14,9 @@ use std::collections::HashMap;
 use std::time::Instant;
 use std::sync::{Arc, RwLock};
 use crate::pocket::tensor::{Tensor, Complex};
+use std::time::{SystemTime, UNIX_EPOCH};
+use std::io::{self, Write};
+use std::fs;
 
 #[allow(dead_code)]
 const PROG_MAX: i32 = 64;   // 命令領域は 0..63
@@ -35,6 +38,7 @@ pub struct Builtin {
 static LAST_DIGEST: AtomicU64 = AtomicU64::new(0);
 #[allow(dead_code)]
 static AI_TICK: AtomicU32 = AtomicU32::new(0);//new
+static RAND_SEED: AtomicU64 = AtomicU64::new(12345);
 
 pub fn last_digest_u32() -> u32 {
     LAST_DIGEST.load(Ordering::Relaxed) as u32
@@ -2703,6 +2707,235 @@ pub fn visualize_placeholder(_args: Vec<Value>) -> Result<Value, SiggError> {
     Ok(Value::Unit)
 }
 
+/// 数学関数のヘルパー（引数チェックと型変換を共通化）
+fn math_unary_op<F>(args: Vec<Value>, name: &str, op: F) -> Result<Value, SiggError>
+where
+    F: Fn(f64) -> f64,
+{
+    if args.len() != 1 {
+        return Err(SiggError::runtime(format!("{} expects 1 argument", name)));
+    }
+
+    match args[0] {
+        Value::Number(n) => Ok(Value::Number(op(n))),
+        Value::Int(i) => Ok(Value::Number(op(i as f64))),
+        _ => Err(SiggError::runtime(format!("{} expects a number", name))),
+    }
+}
+pub fn std_sin(args: Vec<Value>) -> Result<Value, SiggError> {
+    math_unary_op(args, "sin", |n| n.sin())
+}
+pub fn std_cos(args: Vec<Value>) -> Result<Value, SiggError> {
+    math_unary_op(args, "cos", |n| n.cos())
+}
+pub fn std_tan(args: Vec<Value>) -> Result<Value, SiggError> {
+    math_unary_op(args, "tan", |n| n.tan())
+}
+pub fn std_sqrt(args: Vec<Value>) -> Result<Value, SiggError> {
+    math_unary_op(args, "sqrt", |n| n.sqrt())
+}
+/// 指定した桁数でフォーマットする関数: fmt(value, precision)
+pub fn std_fmt(args: Vec<Value>) -> Result<Value, SiggError> {
+    if args.len() != 2 {
+        return Err(SiggError::runtime("fmt expects 2 arguments: (value, precision)"));
+    }
+
+    // args[0]: 値, args[1]: 桁数
+    let target = &args[0];
+    let prec_val = &args[1];
+
+    let precision = match prec_val {
+        Value::Number(n) => *n as usize,
+        Value::Int(i) => *i as usize,
+        _ => return Err(SiggError::runtime("Precision must be a number")),
+    };
+
+    let s = match target {
+        Value::Number(n) => format!("{:.1$}", n, precision),
+        Value::Int(i) => format!("{:.1$}", *i as f64, precision),
+        Value::Str(s) => s.clone(), 
+        // 以前の変更でValue::Stringを追加していればOK。
+        // まだなら format!("{:?}", target) にしてください。
+        
+        _ => format!("{}", target),
+    };
+
+    Ok(Value::Str(s))
+}
+pub fn std_abs(args: Vec<Value>) -> Result<Value, SiggError> {
+    if args.len() != 1 {
+        return Err(SiggError::runtime("abs expects 1 argument"));
+    }
+
+    match args[0] {
+        // 浮動小数点の場合: 3.14 -> 3.14, -3.14 -> 3.14
+        Value::Number(n) => Ok(Value::Number(n.abs())),
+        
+        // 整数の場合: 10 -> 10, -10 -> 10
+        Value::Int(i) => Ok(Value::Int(i.abs())),
+        
+        _ => Err(SiggError::runtime("abs expects a number")),
+    }
+}
+
+pub fn std_rand(args: Vec<Value>) -> Result<Value, SiggError> {
+    // 引数は不要ですが、あっても無視するかエラーにするか選べます
+    // ここでは引数なしを想定
+    
+    // 現在のシードを取得
+    let mut seed = RAND_SEED.load(Ordering::Relaxed);
+
+    // 初回実行時（または特定の値の時）に現在時刻でシードを初期化
+    if seed == 12345 {
+        let start = SystemTime::now();
+        let since = start.duration_since(UNIX_EPOCH).unwrap_or_default();
+        seed = since.as_nanos() as u64;
+    }
+
+    // 線形合同法 (LCG) による更新 (Knuthの定数などを使用)
+    // seed = seed * 6364136223846793005 + 1442695040888963407
+    seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+    
+    // 新しいシードを保存
+    RAND_SEED.store(seed, Ordering::Relaxed);
+
+    // 0.0 〜 1.0 の範囲の浮動小数点に変換
+    // u64の最大値で割る
+    let ret = (seed as f64) / (u64::MAX as f64);
+
+    Ok(Value::Number(ret))
+}
+pub fn std_int(args: Vec<Value>) -> Result<Value, SiggError> {
+    if args.len() != 1 {
+        return Err(SiggError::runtime("int() expects 1 argument"));
+    }
+
+    match &args[0] {
+        // 小数 -> 整数 (小数点以下切り捨て)
+        Value::Number(n) => Ok(Value::Int(*n as i64)),
+        
+        // 整数 -> 整数 (そのまま)
+        Value::Int(i) => Ok(Value::Int(*i)),
+        
+        // 文字列 -> 整数 ("123" -> 123)
+        Value::Str(s) => {
+            match s.parse::<i64>() {
+                Ok(i) => Ok(Value::Int(i)),
+                Err(_) => Err(SiggError::runtime(format!("int(): invalid number string '{}'", s))),
+            }
+        },
+
+        // 真偽値 -> 整数 (true->1, false->0)
+        Value::Bool(b) => Ok(Value::Int(if *b { 1 } else { 0 })),
+
+        _ => Err(SiggError::runtime("int() expects a number or string")),
+    }
+}
+pub fn std_floor(args: Vec<Value>) -> Result<Value, SiggError> {
+    if args.len() != 1 {
+        return Err(SiggError::runtime("floor expects 1 argument"));
+    }
+
+    match args[0] {
+        // 浮動小数点: 3.9 -> 3.0, -3.1 -> -4.0
+        Value::Number(n) => Ok(Value::Number(n.floor())),
+        
+        // 整数: そのまま (5 -> 5)
+        Value::Int(i) => Ok(Value::Int(i)),
+        
+        _ => Err(SiggError::runtime("floor expects a number")),
+    }
+}
+
+
+/// ユーザーからの入力を受け取る: let text = input("Prompt> ");
+pub fn std_input(args: Vec<Value>) -> Result<Value, SiggError> {
+    // プロンプトメッセージがあれば表示
+    if let Some(msg) = args.get(0) {
+        print!("{}", msg);
+        io::stdout().flush().map_err(|e| SiggError::runtime(e.to_string()))?;
+    }
+
+    let mut buffer = String::new();
+    io::stdin()
+        .read_line(&mut buffer)
+        .map_err(|e| SiggError::runtime(e.to_string()))?;
+
+    // 末尾の改行を削除
+    let trimmed = buffer.trim_end().to_string();
+    Ok(Value::Str(trimmed))
+}
+/// ファイルを読み込む: let content = read_file("memory.txt");
+pub fn std_read_file(args: Vec<Value>) -> Result<Value, SiggError> {
+    if args.len() != 1 {
+        return Err(SiggError::runtime("read_file expects 1 argument (filename)"));
+    }
+
+    let filename = match &args[0] {
+        Value::Str(s) => s,
+        _ => return Err(SiggError::runtime("filename must be a string")),
+    };
+
+    let content = fs::read_to_string(filename)
+        .map_err(|e| SiggError::runtime(format!("Failed to read file: {}", e)))?;
+
+    Ok(Value::Str(content))
+}
+/// ファイルに書き込む: write_file("memory.txt", "learned data");
+pub fn std_write_file(args: Vec<Value>) -> Result<Value, SiggError> {
+    if args.len() != 2 {
+        return Err(SiggError::runtime("write_file expects 2 arguments (filename, content)"));
+    }
+
+    let filename = match &args[0] {
+        Value::Str(s) => s,
+        _ => return Err(SiggError::runtime("filename must be a string")),
+    };
+
+    let content = match &args[1] {
+        Value::Str(s) => s,
+        _ => return Err(SiggError::runtime("content must be a string")),
+    };
+
+    fs::write(filename, content)
+        .map_err(|e| SiggError::runtime(format!("Failed to write file: {}", e)))?;
+
+    Ok(Value::Unit)
+}
+
+/// 文字列置換: let new_s = replace("hello world", "world", "AI");
+pub fn std_replace(args: Vec<Value>) -> Result<Value, SiggError> {
+    if args.len() != 3 {
+        return Err(SiggError::runtime("replace expects 3 arguments: (source, from, to)"));
+    }
+
+    let source = match &args[0] { Value::Str(s) => s, _ => return Err(SiggError::runtime("arg 1 must be string")) };
+    let from = match &args[1] { Value::Str(s) => s, _ => return Err(SiggError::runtime("arg 2 must be string")) };
+    let to = match &args[2] { Value::Str(s) => s, _ => return Err(SiggError::runtime("arg 3 must be string")) };
+
+    let result = source.replace(from, to);
+    Ok(Value::Str(result))
+}
+/// 文字列分割: let parts = split("a,b,c", ",");
+pub fn std_split(args: Vec<Value>) -> Result<Value, SiggError> {
+    if args.len() != 2 {
+        return Err(SiggError::runtime("split expects 2 arguments: (source, delimiter)"));
+    }
+
+    let source = match &args[0] { Value::Str(s) => s, _ => return Err(SiggError::runtime("arg 1 must be string")) };
+    let delimiter = match &args[1] { Value::Str(s) => s, _ => return Err(SiggError::runtime("arg 2 must be string")) };
+
+    // 分割して Value::String のリストに変換
+    let parts: Vec<Value> = source
+        .split(delimiter)
+        .map(|s| Value::Str(s.to_string()))
+        .collect();
+
+    // Value::List が定義されている前提 (なければ Value::Vec など適宜変更)
+    Ok(Value::List(parts))
+}
+
+
 pub fn builtins() -> Vec<Builtin> {
     //println!("DEBUG: Loading builtins..."); // ★ これを追加
     vec![
@@ -2805,6 +3038,21 @@ pub fn builtins() -> Vec<Builtin> {
         Builtin { name: "t_set_2d", f: t_set_2d },
         Builtin { name: "laplacian_2d", f: laplacian_2d },
         Builtin { name: "visualize", f: visualize_placeholder },
+
+        Builtin { name: "sin", f: std_sin },
+        Builtin { name: "cos", f: std_cos },
+        Builtin { name: "tan", f: std_tan },
+        Builtin { name: "sqrt", f: std_sqrt },
+        Builtin { name: "fmt", f: std_fmt },
+        Builtin { name: "abs", f: std_abs },
+        Builtin { name: "rand", f: std_rand },
+        Builtin { name: "int", f: std_int },
+        Builtin { name: "floor", f: std_floor },
+        Builtin { name: "input", f: std_input },
+        Builtin { name: "read_file", f: std_read_file },
+        Builtin { name: "write_file", f: std_write_file },
+        Builtin { name: "replace", f: std_replace },
+        Builtin { name: "split", f: std_split },
         //Builtin { name: "", f: },
     ]
 }
