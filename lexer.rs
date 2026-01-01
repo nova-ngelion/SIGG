@@ -109,6 +109,10 @@ impl<'a> Lexer<'a> {
                         other => other,
                     });
                 }
+                '\n' => {
+                    self.line += 1;
+                    out.push('\n');
+                }
                 other => out.push(other),
             }
         }

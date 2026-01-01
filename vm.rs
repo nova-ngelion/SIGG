@@ -5,7 +5,7 @@ use crate::lexer::Lexer;
 use crate::token::Tok;
 use crate::builtins;
 use crate::pocket::tensor::{Tensor, Complex};
-use crate::bytecode::{CompiledProgram, FnId, Op};
+use crate::bytecode::{CompiledProgram, FnId, Op, Chunk};
 use crate::error::SiggError;
 use crate::value::{Grid, GridRef, Value};
 use std::net::TcpStream;
@@ -98,6 +98,7 @@ pub struct VM {
     pub globals: HashMap<String, Value>,
     pub seed: u64,
     pub current_stream: Option<TcpStream>,
+    pub stack: Vec<Value>,
 }
 
 impl VM {
@@ -145,11 +146,45 @@ impl VM {
             globals: g,
             seed: 0,
             current_stream: None, 
+            stack: Vec::new(),
         }
     }
     // ストリームを外からセットするためのメソッドを追加
     pub fn set_stream(&mut self, stream: TcpStream) {
         self.current_stream = Some(stream);
+    }
+    fn push(&mut self, value: Value) -> Result<(), SiggError> {
+        self.stack.push(value);
+        Ok(())
+    }
+
+    fn pop(&mut self) -> Result<Value, SiggError> {
+        self.stack.pop().ok_or_else(|| SiggError::runtime("Stack underflow"))
+    }
+
+    fn peek(&self, distance: usize) -> Result<&Value, SiggError> {
+        let len = self.stack.len();
+        if distance >= len {
+            return Err(SiggError::runtime("Stack underflow"));
+        }
+        Ok(&self.stack[len - 1 - distance])
+    }
+
+    // 定数プールから文字列を取得するヘルパー ▼▼▼
+    
+    // Chunk から文字列定数を取得する
+    // idx は Op::DefGlobal(idx) などで渡されるインデックス
+    fn get_string_constant(&self, chunk: &Chunk, idx: usize) -> Result<String, SiggError> {
+        // chunk.constants は Vec<Value> だと仮定します
+        if idx >= chunk.consts.len() {
+             return Err(SiggError::runtime("Constant index out of bounds"));
+        }
+        match &chunk.consts[idx] {
+            Value::Str(s) => Ok(s.clone()),
+            // もし定数プールに文字列そのものが入っているのではなく、
+            // 別途シンボルテーブルがあるなら、そちらを参照する実装に変えてください
+            _ => Err(SiggError::runtime("Expected string constant for variable name")),
+        }
     }
     // 2Dラプラシアンの実装
     pub fn compute_laplacian_2d(&mut self, tensor_val: Value) -> Result<Value, SiggError> {
@@ -924,12 +959,12 @@ impl VM {
                     stack.push(Value::Lambda(id));
                 }
                 Op::DefGlobal(idx) => {
-                    let name = self.get_string_constant(chunk, *idx)?;
+                    let name = self.get_string_constant(chunk, idx)?;
                     let val = self.pop()?; // スタックにある初期化値を取り出す
                     self.globals.insert(name, val); // グローバルマップに保存
                 }
                 Op::GetGlobal(idx) => {
-                    let name = self.get_string_constant(chunk, *idx)?;
+                    let name = self.get_string_constant(chunk, idx)?;
                     if let Some(val) = self.globals.get(&name) {
                         self.push(val.clone())?;
                     } else {
@@ -937,7 +972,7 @@ impl VM {
                     }
                 }
                 Op::SetGlobal(idx) => {
-                    let name = self.get_string_constant(chunk, *idx)?;
+                    let name = self.get_string_constant(chunk, idx)?;
                     let val = self.peek(0)?; // 代入値（スタックトップ）を確認
                     
                     if self.globals.contains_key(&name) {
@@ -1127,11 +1162,13 @@ impl VM {
                     break;
                 }
                 Op::DefGlobal(idx) => {
-                    let name = self.get_string_constant(chunk, *idx)?;
-                    let val = self.pop()?; // スタックにある初期化値を取り出す
-                    self.globals.insert(name, val); // グローバルマップに保存
+                    // ▼ *idx ではなく idx を使う
+                    let name = self.get_string_constant(chunk, *idx)?; 
+                    let val = self.pop()?;
+                    self.globals.insert(name, val);
                 }
                 Op::GetGlobal(idx) => {
+                    // ▼ *idx ではなく idx を使う
                     let name = self.get_string_constant(chunk, *idx)?;
                     if let Some(val) = self.globals.get(&name) {
                         self.push(val.clone())?;
@@ -1140,13 +1177,14 @@ impl VM {
                     }
                 }
                 Op::SetGlobal(idx) => {
+                    // ▼ *idx ではなく idx を使う
                     let name = self.get_string_constant(chunk, *idx)?;
-                    let val = self.peek(0)?; // 代入値（スタックトップ）を確認
+                    let val = self.peek(0)?; 
                     
                     if self.globals.contains_key(&name) {
                         self.globals.insert(name, val.clone());
-                        // 代入式は値を残すか、Statementならpopするかは言語仕様による
-                        // 通常の文(Stmt)ならこの後 Pop が呼ばれるはず
+                        // 文脈によってはここで pop する必要があるかもしれませんが、
+                        // 代入式として値を残すならそのままでOK
                     } else {
                         return Err(SiggError::runtime(format!("Undefined global variable: '{}'", name)));
                     }

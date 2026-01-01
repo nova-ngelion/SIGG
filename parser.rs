@@ -75,7 +75,6 @@ impl<'a> Parser<'a> {
         let mut namespaces = vec![];
         let mut fns = vec![];
         let mut stmts = vec![];
-        
         while self.cur.is_some() {
             match self.cur_kind() {
                 Some(Tok::Import) => {
@@ -98,7 +97,7 @@ impl<'a> Parser<'a> {
             }
         }
         
-        Ok(Program { imports, namespaces, fns })
+        Ok(Program { imports, namespaces, fns, stmts })
     }
 
     fn parse_fn_def(&mut self) -> Result<FnDef, SiggError> {

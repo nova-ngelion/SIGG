@@ -220,7 +220,7 @@ impl<'a> FnCompiler<'a> {
                         // 変数名をテーブルに登録してIDを取得
                         // (FnTableの実装に合わせて intern か add_string を使ってください)
                         let name_idx = self.table.intern(name); 
-                        self.chunk.emit(Op::DefGlobal(name_idx));
+                        self.chunk.emit(Op::DefGlobal(name_idx.0 as usize));
                     } else {
                         // 複雑なパターン（タプル分解など）はグローバルでは一旦非対応にするか、個別に実装が必要
                         return Err(SiggError::runtime("Global destructing definitions not supported yet"));
@@ -250,6 +250,9 @@ impl<'a> FnCompiler<'a> {
                             // 変数名からスロット番号を解決する（メソッド名は既存のコードに合わせてください）
                             if let Some(slot) = self.resolve_local(name) {
                                 self.chunk.emit(Op::StoreLocal(slot as u16));
+                            } else {
+                                let name_idx = self.table.intern(name);
+                                self.chunk.emit(Op::SetGlobal(name_idx.0 as usize));
                             }
                         }
                         Ok(())
@@ -263,7 +266,7 @@ impl<'a> FnCompiler<'a> {
                         } else {
                             // 2. なければグローバルとして SetGlobal
                             let name_idx = self.table.intern(name);
-                            self.chunk.emit(Op::SetGlobal(name_idx));
+                            self.chunk.emit(Op::SetGlobal(name_idx.0 as usize));
                         }
                         Ok(())
                     }
@@ -440,7 +443,7 @@ impl<'a> FnCompiler<'a> {
                 // }
                 // 3) 未定義はエラー（Unit を作らない）
                 let name_idx = self.table.intern(name);
-                self.chunk.emit(Op::GetGlobal(name_idx));
+                self.chunk.emit(Op::GetGlobal(name_idx.0 as usize));
                 return Ok(());
             }
             Expr::NamespacedVar { namespace, name } => {
