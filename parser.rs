@@ -74,6 +74,7 @@ impl<'a> Parser<'a> {
         let mut imports = vec![];
         let mut namespaces = vec![];
         let mut fns = vec![];
+        let mut stmts = vec![];
         
         while self.cur.is_some() {
             match self.cur_kind() {
@@ -90,7 +91,10 @@ impl<'a> Parser<'a> {
                 Some(Tok::Fn) => {
                     fns.push(self.parse_fn_def()?);
                 }
-                _ => return Err(SiggError::parse("expected import, namespace, or fn")),
+                _ =>{ // let, loop, if, 式などがここに来る                    
+                        let stmt = self.parse_stmt()?;
+                        stmts.push(stmt);
+                    }
             }
         }
         

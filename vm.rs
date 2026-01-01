@@ -305,6 +305,32 @@ impl VM {
                         };
                         return self.run_eval(source);
                     }
+                    // 戻り値: [success(bool), result_or_error(string/value)]
+                    "try_eval" => {
+                        if args.len() != 1 {
+                            return Err(SiggError::runtime("try_eval expects 1 argument"));
+                        }
+                        let source = match &args[0] {
+                            Value::Str(s) => s.clone(),
+                            _ => return Err(SiggError::runtime("try_eval expects a string")),
+                        };
+
+                        // 実行してみる
+                        match self.run_eval(source) {
+                            Ok(val) => {
+                                // 成功: [true, 値]
+                                return Ok(Value::List(vec![Value::Bool(true), val]));
+                            }
+                            Err(e) => {
+                                // 失敗: [false, エラーメッセージ]
+                                // エラーでも止まらずに「失敗した」という事実を返す
+                                return Ok(Value::List(vec![
+                                    Value::Bool(false),
+                                    Value::Str(format!("{}", e))
+                                ]));
+                            }
+                        }
+                    }
                     _ => {} // 次へ進む
                 }
             
@@ -897,6 +923,31 @@ impl VM {
                 Op::MakeLambda(id) => {
                     stack.push(Value::Lambda(id));
                 }
+                Op::DefGlobal(idx) => {
+                    let name = self.get_string_constant(chunk, *idx)?;
+                    let val = self.pop()?; // スタックにある初期化値を取り出す
+                    self.globals.insert(name, val); // グローバルマップに保存
+                }
+                Op::GetGlobal(idx) => {
+                    let name = self.get_string_constant(chunk, *idx)?;
+                    if let Some(val) = self.globals.get(&name) {
+                        self.push(val.clone())?;
+                    } else {
+                        return Err(SiggError::runtime(format!("Undefined global variable: '{}'", name)));
+                    }
+                }
+                Op::SetGlobal(idx) => {
+                    let name = self.get_string_constant(chunk, *idx)?;
+                    let val = self.peek(0)?; // 代入値（スタックトップ）を確認
+                    
+                    if self.globals.contains_key(&name) {
+                        self.globals.insert(name, val.clone());
+                        // 代入式は値を残すか、Statementならpopするかは言語仕様による
+                        // 通常の文(Stmt)ならこの後 Pop が呼ばれるはず
+                    } else {
+                        return Err(SiggError::runtime(format!("Undefined global variable: '{}'", name)));
+                    }
+                }
             }
         }
 
@@ -1074,6 +1125,31 @@ impl VM {
                 }
                 Op::Return => {
                     break;
+                }
+                Op::DefGlobal(idx) => {
+                    let name = self.get_string_constant(chunk, *idx)?;
+                    let val = self.pop()?; // スタックにある初期化値を取り出す
+                    self.globals.insert(name, val); // グローバルマップに保存
+                }
+                Op::GetGlobal(idx) => {
+                    let name = self.get_string_constant(chunk, *idx)?;
+                    if let Some(val) = self.globals.get(&name) {
+                        self.push(val.clone())?;
+                    } else {
+                        return Err(SiggError::runtime(format!("Undefined global variable: '{}'", name)));
+                    }
+                }
+                Op::SetGlobal(idx) => {
+                    let name = self.get_string_constant(chunk, *idx)?;
+                    let val = self.peek(0)?; // 代入値（スタックトップ）を確認
+                    
+                    if self.globals.contains_key(&name) {
+                        self.globals.insert(name, val.clone());
+                        // 代入式は値を残すか、Statementならpopするかは言語仕様による
+                        // 通常の文(Stmt)ならこの後 Pop が呼ばれるはず
+                    } else {
+                        return Err(SiggError::runtime(format!("Undefined global variable: '{}'", name)));
+                    }
                 }
                 
                 // 簡易実行では複雑な操作は未対応

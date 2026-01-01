@@ -3,6 +3,7 @@ pub struct Program {
     pub imports: Vec<String>,
     pub namespaces: Vec<NamespaceDef>,
     pub fns: Vec<FnDef>,
+    pub stmts: Vec<Stmt>,
 }
 
 #[derive(Clone, Debug)]

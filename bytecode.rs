@@ -59,6 +59,10 @@ pub enum Op {
     Index, // generic index: stack [.., expr, index] -> [.., value]
 
     MakeLambda(FnId), // lambda作成
+
+    DefGlobal(usize), // グローバル変数を定義 (let a = 10;)
+    GetGlobal(usize), // グローバル変数を取得 (print(a);)
+    SetGlobal(usize), // グローバル変数を更新 (a = 20;)
 }
 
 #[derive(Clone, Debug)]
@@ -130,11 +134,19 @@ pub struct FnCompiler<'a> {
     pub table: &'a mut FnTable,
     pub next_repeat_slot: u16,
     pub lambda_fns: Vec<(FnId, Chunk, Span)>,
+    pub scope_depth: usize, // ★ 追加
 }
 
 impl<'a> FnCompiler<'a> {
     pub fn new(table: &'a mut FnTable) -> Self {
-        Self { locals: HashMap::new(), chunk: Chunk::new(), table, next_repeat_slot: 0, lambda_fns: vec![] }
+        Self {
+            locals: HashMap::new(),
+            chunk: Chunk::new(),
+            table,
+            next_repeat_slot: 0,
+            lambda_fns: vec![],
+            scope_depth: 0,
+        }
     }
     pub fn resolve_local(&self, name: &str) -> Option<u16> {
         self.locals.get(name).copied()
@@ -192,16 +204,36 @@ impl<'a> FnCompiler<'a> {
         match s {
             // ★ 修正: type_ann フィールドを追加
             Stmt::Let { pat, type_ann, expr } => {
-                // type_ann は型チェック時に使用、コンパイル時は無視
                 let _ = type_ann;
+                // 1. まず右辺の式を評価してスタックに積む
                 self.compile_expr(expr)?;
-                self.compile_store_pattern(pat)?;
+
+                // 2. スコープによって処理を分岐
+                if self.scope_depth > 0 {
+                    // --- ローカル変数の場合 ---
+                    // 既存のロジック (compile_store_pattern が StoreLocal を発行する)
+                    self.compile_store_pattern(pat)?;
+                } else {
+                    // --- グローバル変数の場合 ---
+                    // パターンが単純な変数名であることを確認
+                    if let Pattern::Name(name) = pat {
+                        // 変数名をテーブルに登録してIDを取得
+                        // (FnTableの実装に合わせて intern か add_string を使ってください)
+                        let name_idx = self.table.intern(name); 
+                        self.chunk.emit(Op::DefGlobal(name_idx));
+                    } else {
+                        // 複雑なパターン（タプル分解など）はグローバルでは一旦非対応にするか、個別に実装が必要
+                        return Err(SiggError::runtime("Global destructing definitions not supported yet"));
+                    }
+                }
                 Ok(())
             }
             Stmt::Block { body } => {
+                self.scope_depth += 1; // ★ スコープイン
                 self.chunk.emit(Op::PushScope);
                 for st in body { self.compile_stmt(st)?; }
                 self.chunk.emit(Op::PopScope);
+                self.scope_depth -= 1; // ★ スコープアウト
                 Ok(())
             }
             Stmt::Assign { lhs, expr: rhs_expr } => {
@@ -223,9 +255,15 @@ impl<'a> FnCompiler<'a> {
                         Ok(())
                     }
                     Expr::Var(name) => {
-                        self.compile_expr(rhs_expr)?;
+                        self.compile_expr(rhs_expr)?; // 値をスタックへ
+
+                        // 1. ローカルにあれば StoreLocal
                         if let Some(slot) = self.resolve_local(name) {
                             self.chunk.emit(Op::StoreLocal(slot as u16));
+                        } else {
+                            // 2. なければグローバルとして SetGlobal
+                            let name_idx = self.table.intern(name);
+                            self.chunk.emit(Op::SetGlobal(name_idx));
                         }
                         Ok(())
                     }
@@ -395,13 +433,15 @@ impl<'a> FnCompiler<'a> {
                     return Ok(());
                 }
                 // 2) 関数名なら関数値として参照（= Lambda(FnId) を積む）
-                if let Some(id) = self.table.name_to_id.get(name).copied() {
-                    let ci = self.chunk.add_const(Value::Lambda(id));
-                    self.chunk.emit(Op::Const(ci));
-                    return Ok(());
-                }
+                // if let Some(id) = self.table.name_to_id.get(name).copied() {
+                //     let ci = self.chunk.add_const(Value::Lambda(id));
+                //     self.chunk.emit(Op::Const(ci));
+                //     return Ok(());
+                // }
                 // 3) 未定義はエラー（Unit を作らない）
-                Err(SiggError::runtime(format!("undefined variable: {}", name)))
+                let name_idx = self.table.intern(name);
+                self.chunk.emit(Op::GetGlobal(name_idx));
+                return Ok(());
             }
             Expr::NamespacedVar { namespace, name } => {
                 let qualified = format!("{}::{}", namespace, name);

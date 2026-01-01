@@ -17,6 +17,9 @@ use crate::pocket::tensor::{Tensor, Complex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::io::{self, Write};
 use std::fs;
+use std::path::Path;
+use serde_json::json;
+use std::process::Command;
 
 #[allow(dead_code)]
 const PROG_MAX: i32 = 64;   // 命令領域は 0..63
@@ -2935,6 +2938,108 @@ pub fn std_split(args: Vec<Value>) -> Result<Value, SiggError> {
     Ok(Value::List(parts))
 }
 
+pub fn std_delete_file(args: Vec<Value>) -> Result<Value, SiggError> {
+    if args.len() != 1 { return Err(SiggError::runtime("delete_file expects 1 argument")); }
+    let filename = match &args[0] { Value::Str(s) => s, _ => return Err(SiggError::runtime("arg must be string")) };
+    
+    fs::remove_file(filename).map_err(|e| SiggError::runtime(format!("Delete failed: {}", e)))?;
+    Ok(Value::Bool(true))
+}
+/// ディレクトリ一覧取得: list_dir(".")
+pub fn std_list_dir(args: Vec<Value>) -> Result<Value, SiggError> {
+    let path_str = if args.is_empty() { ".".to_string() } else {
+        match &args[0] { Value::Str(s) => s.clone(), _ => ".".to_string() }
+    };
+
+    let paths = fs::read_dir(path_str).map_err(|e| SiggError::runtime(format!("List dir failed: {}", e)))?;
+    let mut list = Vec::new();
+
+    for path in paths {
+        if let Ok(entry) = path {
+            if let Ok(name) = entry.file_name().into_string() {
+                list.push(Value::Str(name));
+            }
+        }
+    }
+    Ok(Value::List(list))
+}
+pub fn std_try_eval(_args: Vec<Value>) -> Result<Value, SiggError> {
+    // 中身は空でOK。実行時は vm.rs 側で上書き（フック）されます。
+    Ok(Value::Unit)
+}
+/// LLMに問い合わせる: let response = ask_llm("system prompt", "user prompt");
+pub fn std_ask_llm(args: Vec<Value>) -> Result<Value, SiggError> {
+    if args.len() != 2 {
+        return Err(SiggError::runtime("ask_llm expects 2 arguments: (system_prompt, user_msg)"));
+    }
+
+    let system_prompt = match &args[0] { Value::Str(s) => s, _ => return Err(SiggError::runtime("arg 1 must be string")) };
+    let user_msg = match &args[1] { Value::Str(s) => s, _ => return Err(SiggError::runtime("arg 2 must be string")) };
+
+    // Ollamaへのリクエストボディ
+    let client = reqwest::blocking::Client::new();
+    let body = json!({
+        "model": "llama3.1",
+        "stream": false, // 一括で返してもらう
+        "messages": [
+            { "role": "system", "content": system_prompt },
+            { "role": "user", "content": user_msg }
+        ],
+        "options": {
+            "temperature": 0.0 // コマンド解析なのでランダム性をなくす
+        }
+    });
+
+    // リクエスト送信 (localhost:11434 はOllamaのデフォルトポート)
+    let res = client.post("http://localhost:11434/api/chat")
+        .json(&body)
+        .send()
+        .map_err(|e| SiggError::runtime(format!("LLM Request Failed: {}", e)))?;
+
+    // レスポンスの解析
+    let json_resp: serde_json::Value = res.json()
+        .map_err(|e| SiggError::runtime(format!("Invalid JSON: {}", e)))?;
+
+    let content = json_resp["message"]["content"]
+        .as_str()
+        .unwrap_or("")
+        .trim()
+        .to_string();
+
+    Ok(Value::Str(content))
+}
+
+/// OSのシェルコマンドを実行: shell("cargo build --release")
+pub fn std_shell(args: Vec<Value>) -> Result<Value, SiggError> {
+    if args.len() != 1 { return Err(SiggError::runtime("shell expects 1 argument")); }
+    let cmd_str = match &args[0] { Value::Str(s) => s, _ => return Err(SiggError::runtime("arg must be string")) };
+
+    println!("[System] Executing: {}", cmd_str);
+
+    // Windowsなら cmd /C, Linux/Macなら sh -c
+    let output = if cfg!(target_os = "windows") {
+        Command::new("cmd")
+            .args(["/C", cmd_str])
+            .output()
+    } else {
+        Command::new("sh")
+            .arg("-c")
+            .arg(cmd_str)
+            .output()
+    };
+
+    match output {
+        Ok(o) => {
+            // 標準出力を取得
+            let stdout = String::from_utf8_lossy(&o.stdout).to_string();
+            let stderr = String::from_utf8_lossy(&o.stderr).to_string();
+            // 成功かどうかに関わらず、ログとして返す（あるいは終了コードを見る）
+            Ok(Value::Str(format!("STDOUT:\n{}\nSTDERR:\n{}", stdout, stderr)))
+        }
+        Err(e) => Err(SiggError::runtime(format!("Shell command failed: {}", e))),
+    }
+}
+
 
 pub fn builtins() -> Vec<Builtin> {
     //println!("DEBUG: Loading builtins..."); // ★ これを追加
@@ -3053,6 +3158,11 @@ pub fn builtins() -> Vec<Builtin> {
         Builtin { name: "write_file", f: std_write_file },
         Builtin { name: "replace", f: std_replace },
         Builtin { name: "split", f: std_split },
+        Builtin { name: "delete_file", f: std_delete_file },
+        Builtin { name: "list_dir", f: std_list_dir },
+        Builtin { name: "try_eval", f: std_try_eval },
+        Builtin { name: "ask_llm", f: std_ask_llm },
+        Builtin { name: "shell", f: std_shell },
         //Builtin { name: "", f: },
     ]
 }
