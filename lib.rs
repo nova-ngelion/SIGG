@@ -20,5 +20,7 @@ pub mod code_generator;
 pub mod file_operations;
 pub mod self_modify;
 pub mod ai_assistant;
+pub mod autonomous_ai;
+pub mod voice_text_interface;
 
 pub mod server;
