@@ -14,5 +14,11 @@ pub mod pocket;
 pub mod state;
 pub mod ai_runtime;
 pub mod type_checker;
+pub mod llm_interface;
+pub mod sigg_gnn;
+pub mod code_generator;
+pub mod file_operations;
+pub mod self_modify;
+pub mod ai_assistant;
 
 pub mod server;
