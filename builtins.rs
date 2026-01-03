@@ -3039,6 +3039,108 @@ pub fn std_shell(args: Vec<Value>) -> Result<Value, SiggError> {
         Err(e) => Err(SiggError::runtime(format!("Shell command failed: {}", e))),
     }
 }
+/// try_unwrap(result_list)
+/// try_evalの戻り値 [bool, val] を受け取る。
+/// trueなら val を返し、falseなら val (エラーメッセージ) でランタイムエラーを起こす。
+pub fn std_try_unwrap(args: Vec<Value>) -> Result<Value, SiggError> {
+    if args.len() != 1 {
+        return Err(SiggError::runtime("try_unwrap expects 1 argument (the result list)"));
+    }
+
+    // 引数がリストかチェック
+    match &args[0] {
+        Value::List(items) => {
+            if items.len() < 2 {
+                return Err(SiggError::runtime("try_unwrap expects a list of length 2: [success, value]"));
+            }
+            
+            // 0番目がBoolかチェック
+            let success = match items[0] {
+                Value::Bool(b) => b,
+                _ => return Err(SiggError::runtime("First element of result must be a boolean")),
+            };
+
+            // 1番目が値
+            let content = items[1].clone();
+
+            if success {
+                Ok(content)
+            } else {
+                // 失敗時はエラーとして停止させる（メッセージを見やすく整形）
+                let msg = match content {
+                    Value::Str(s) => s,
+                    _ => format!("{:?}", content),
+                };
+                Err(SiggError::runtime(format!("Unwrap Panic: {}", msg)))
+            }
+        }
+        _ => Err(SiggError::runtime("try_unwrap expects a List")),
+    }
+}
+/// format("Hello {}, your score is {}", "World", 100)
+/// 文字列内の "{}" を引数で順番に置き換える簡易フォーマッター
+pub fn std_format(args: Vec<Value>) -> Result<Value, SiggError> {
+    if args.len() < 1 {
+        return Err(SiggError::runtime("format expects at least 1 argument (template string)"));
+    }
+
+    let template = match &args[0] {
+        Value::Str(s) => s,
+        _ => return Err(SiggError::runtime("First argument to format must be a string")),
+    };
+
+    let mut result = String::new();
+    let parts: Vec<&str> = template.split("{}").collect();
+    let values = &args[1..]; // 埋め込む値たち
+
+    // テンプレートの各部分と値を交互に結合
+    for (i, part) in parts.iter().enumerate() {
+        result.push_str(part);
+        
+        // 最後のパーツの後ろには値を入れない（splitの仕様上）
+        // かつ、埋め込む値が残っている場合のみ追加
+        if i < parts.len() - 1 {
+            if i < values.len() {
+                // Value型の文字列表現を取得（Display実装やデバッグ表示に依存）
+                // ※ Value型に to_string_value() のようなメソッドがあればそれを使うのがベスト
+                // ここでは簡易的に Debug表示などを使うか、型ごとに処理
+                let val_str = match &values[i] {
+                    Value::Str(s) => s.clone(),
+                    Value::Number(n) => n.to_string(),
+                    Value::Bool(b) => b.to_string(),
+                    v => format!("{:?}", v), // ListなどはDebug表示
+                };
+                result.push_str(&val_str);
+            } else {
+                // 値が足りない場合は {} をそのまま残すか、エラーにするか
+                // ここでは安全に "(undefined)" とする
+                result.push_str("(undefined)");
+            }
+        }
+    }
+
+    Ok(Value::Str(result))
+}
+/// pow(base, exponent) -> base^exponent
+pub fn std_pow(args: Vec<Value>) -> Result<Value, SiggError> {
+    if args.len() != 2 {
+        return Err(SiggError::runtime("pow expects 2 arguments: (base, exponent)"));
+    }
+
+    let base = match args[0] {
+        Value::Number(n) => n,
+        _ => return Err(SiggError::runtime("Base must be a number")),
+    };
+
+    let exp = match args[1] {
+        Value::Number(n) => n,
+        _ => return Err(SiggError::runtime("Exponent must be a number")),
+    };
+
+    // f64のpowfを使用
+    let res = base.powf(exp);
+    Ok(Value::Number(res))
+}
 
 
 pub fn builtins() -> Vec<Builtin> {
@@ -3163,6 +3265,9 @@ pub fn builtins() -> Vec<Builtin> {
         Builtin { name: "try_eval", f: std_try_eval },
         Builtin { name: "ask_llm", f: std_ask_llm },
         Builtin { name: "shell", f: std_shell },
+        Builtin { name: "try_unwrap", f: std_try_unwrap },
+        Builtin { name: "format", f: std_format },
+        Builtin { name: "pow", f: std_pow },        
         //Builtin { name: "", f: },
     ]
 }
